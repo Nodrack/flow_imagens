@@ -283,6 +283,14 @@ def render_settings(config: AppConfig) -> AppConfig:
             value=float(config.timer_max_hours), step=1.0,
             help="Acima disso o cronômetro é tratado como esquecido: ao parar, você informa os minutos reais.",
         )
+        st.markdown("**Checagem técnica automática (CPU)**")
+        quality_values = {}
+        for field, label in {
+            "min_sharpness": "Nitidez mínima (Laplaciano)", "max_noise": "Ruído máximo estimado",
+            "max_black_percent": "Percentual máximo de pretos", "max_white_percent": "Percentual máximo de estourados",
+            "black_level": "Nível preto (0 a 127)", "white_level": "Nível branco (128 a 255)",
+        }.items():
+            quality_values[field] = st.number_input(label, value=getattr(config.quality_rules, field))
         saved = st.form_submit_button("Salvar configuração", type="primary")
     if saved:
         new_config = AppConfig(
@@ -301,6 +309,7 @@ def render_settings(config: AppConfig) -> AppConfig:
             generation_sizes=sizes,
             upscale_factor=float(upscale_factor),
             timer_max_hours=float(timer_max_hours),
+            quality_rules=quality_values,
             export_rules={
                 "min_megapixels": min_mp or None,
                 "max_megapixels": max_mp or None,
@@ -1693,6 +1702,22 @@ def render_export(orchestrator: Orchestrator, collection_id: str | None) -> None
         return
     database = orchestrator.database
     concepts = database.list_concepts(collection_id)
+    with st.expander("Calibração com imagens moderadas"):
+        st.caption("Compare aprovadas e rejeitadas antes de ajustar os limiares na Configuração. As métricas não garantem aprovação; ruído também responde a textura. Imagens externas sem arquivo local não são analisadas.")
+        if st.button("Analisar referências locais", key="quality_references"):
+            from flowapp.quality import inspect_image
+            rows = []
+            for record in orchestrator.database.list_moderation():
+                if record["status"] not in {"approved", "rejected"} or not record.get("concept_id"):
+                    continue
+                reference = final_upscale(orchestrator.database, record["concept_id"])
+                if reference:
+                    path = Path((reference.get("export") or {}).get("path") or reference["path"])
+                    report = inspect_image(path, orchestrator.config.quality_rules, orchestrator.config.export_rules)
+                    rows.append({"Imagem": record["title"], "Moderação": record["status"],
+                                 "Motivo Adobe": record.get("reason", ""), "Checagem": report["status"],
+                                 "Motivos": " ".join(report["reasons"]), **report["metrics"]})
+            st.dataframe(rows, hide_index=True)
     rules = orchestrator.config.export_rules
     st.caption("Nenhum endpoint de upload Adobe será chamado. Transferência, submissão e decisão Adobe têm confirmações separadas.")
     if not rules.technical_rules_verified:
@@ -1787,7 +1812,7 @@ def render_prepare_all(orchestrator: Orchestrator, concepts: list[dict]) -> None
         progress = st.progress(0.0, text="Preparando pacotes…")
         for index, concept in enumerate(ready, start=1):
             try:
-                orchestrator.prepare_package(concept)
+                orchestrator.prepare_package(concept, allow_warnings=confirmed)
             except Exception as error:
                 failures.append(f"{concept['data']['concept']}: {error}")
             progress.progress(index / len(ready), text=f"{index}/{len(ready)} pacote(s) processado(s)")
@@ -1852,9 +1877,19 @@ def render_concept_export(orchestrator: Orchestrator, collection_id: str, concep
             metadata = asset.get("metadata") or {}
             st.markdown(f"**{metadata.get('title_en', '')}**")
             st.caption(f"{len(metadata.get('keywords', []))} palavras-chave")
-            if st.button("Preparar JPEG", type="primary", key=f"prepare_package_{concept['id']}"):
+            _, preview = orchestrator.images.export_jpeg(
+                asset, metadata.get("title_en", ""), metadata.get("keywords", []),
+                orchestrator.config.export_rules, quality_rules=orchestrator.config.quality_rules, preview=True,
+            )
+            technical = preview["technical"]
+            st.write("Checagem técnica: " + {"approved": "aprovada", "warning": "alerta", "blocked": "bloqueada"}[technical["status"]])
+            st.json(technical["metrics"], expanded=False)
+            for reason in preview["warnings"]:
+                st.warning(reason)
+            confirmed = st.checkbox("Revisei os alertas e quero incluir esta imagem", key=f"quality_confirm_{concept['id']}") if preview["warnings"] else True
+            if st.button("Preparar JPEG", type="primary", key=f"prepare_package_{concept['id']}", disabled=technical["status"] == "blocked" or not confirmed):
                 try:
-                    output, _ = orchestrator.prepare_package(concept)
+                    output, _ = orchestrator.prepare_package(concept, allow_warnings=confirmed)
                     st.success(f"Pacote preparado: {output}")
                     st.rerun()
                 except Exception as error:

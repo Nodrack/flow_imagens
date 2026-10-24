@@ -621,7 +621,7 @@ def test_metadata_with_image_does_not_require_description(setup_project, tmp_pat
     assert "<descricao>" not in sent["user"]
 
 
-def test_prepare_package_exports_jpeg_without_extra_confirmation(setup_project):
+def test_prepare_package_exports_jpeg_with_warning_confirmation(setup_project):
     from flowapp.config import AppConfig
     from flowapp.orchestrator import Orchestrator
 
@@ -647,7 +647,7 @@ def test_prepare_package_exports_jpeg_without_extra_confirmation(setup_project):
 
     database.update_asset_metadata(upscaled_id, {"title_en": "Urban greenhouse", "keywords": ["greenhouse", "balcony"]})
     database.transition_concept(concept_id, WorkflowState.METADATA_READY, "teste")
-    output, report = orchestrator.prepare_package(database.get_concept(concept_id))
+    output, report = orchestrator.prepare_package(database.get_concept(concept_id), allow_warnings=True)
     orchestrator.close()
 
     assert output.suffix == ".jpg" and output.is_file()

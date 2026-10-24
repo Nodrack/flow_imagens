@@ -444,7 +444,7 @@ class Orchestrator:
                 concept_id, WorkflowState.CANCELLED, "Cancelamento explícito pelo usuário"
             )
 
-    def prepare_package(self, concept: dict) -> tuple[Path, dict]:
+    def prepare_package(self, concept: dict, allow_warnings: bool = False) -> tuple[Path, dict]:
         """Exporta o JPEG final com metadados e registra o pacote como pronto para transferência."""
         if concept["state"] != WorkflowState.METADATA_READY.value:
             raise ValueError("Aprove os metadados antes de preparar o pacote.")
@@ -457,6 +457,7 @@ class Orchestrator:
             raise ValueError("O conceito não tem título e palavras-chave salvos.")
         output, report = self.images.export_jpeg(
             asset, metadata["title_en"], metadata["keywords"], self.config.export_rules,
+            quality_rules=self.config.quality_rules, allow_warnings=allow_warnings,
         )
         self.database.transition_concept(concept["id"], WorkflowState.LOCALLY_APPROVED, "Aprovação local do pacote")
         self.database.transition_concept(
