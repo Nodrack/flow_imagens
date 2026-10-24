@@ -96,6 +96,7 @@ class LMStudioClient(_BaseLMStudioClient):
         style_guide: str = "",
         hint: str = "",
         lessons: str = "",
+        seasonal: str = "",
     ) -> tuple[PlannerOutput, int, int]:
         count = count or brief.concept_count
         system = _read_instruction("planner")
@@ -127,6 +128,8 @@ class LMStudioClient(_BaseLMStudioClient):
                 lessons
                 + "Use esse histórico para planejar conceitos e prompts com mais chance de aprovação.\n"
             )
+        if seasonal:
+            context += seasonal
         user = (
             f"Crie exatamente {count} conceito(s) distintos. Cada conceito precisa conter "
             "concept, commercial_application, main_subject, composition_and_copy_space, "
