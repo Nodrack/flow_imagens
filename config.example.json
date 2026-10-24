@@ -1,0 +1,38 @@
+{
+  "comfy_base_url": "http://127.0.0.1:8188",
+  "lmstudio_base_url": "http://127.0.0.1:1234",
+  "planner_model": "",
+  "vision_model": "",
+  "request_timeout_seconds": 20.0,
+  "agent_timeout_seconds": 300,
+  "model_load_timeout_seconds": 600,
+  "generation_timeout_seconds": 1800,
+  "poll_interval_seconds": 1.0,
+  "max_agent_attempts": 2,
+  "candidates_per_concept": 1,
+  "auto_regenerations": 1,
+  "free_vram_between_phases": true,
+  "generation_sizes": {
+    "horizontal": [
+      1344,
+      768
+    ],
+    "vertical": [
+      768,
+      1344
+    ],
+    "square": [
+      1024,
+      1024
+    ]
+  },
+  "export_rules": {
+    "min_megapixels": null,
+    "max_megapixels": null,
+    "max_file_bytes": null,
+    "jpeg_quality": 95,
+    "technical_rules_verified": false,
+    "checked_at": "2026-09-30",
+    "source": ""
+  }
+}
