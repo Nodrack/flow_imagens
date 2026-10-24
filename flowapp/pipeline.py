@@ -11,7 +11,8 @@ from typing import Any
 
 from agentkit import Pipeline, PipelineAbort, StepContext
 
-from flowapp.agents import INSTRUCTION_VERSION, AgentError, adobe_lessons
+from flowapp.agents import INSTRUCTION_VERSION, PLANNER_INSTRUCTION_VERSION, AgentError, adobe_lessons
+from flowapp.briefings import concept_reference
 from flowapp.comfy import ComfyError
 from flowapp.database import InvalidTransition, utc_now
 from flowapp.images import ImageValidationError
@@ -296,7 +297,8 @@ class AgentPipeline:
         collection = self.database.get_collection(ctx.subject) or {}
         planning = dict(collection.get("planning") or {})
         style_guide = planning.get("style_guide", "")
-        avoid = [concept["data"]["concept"] for concept in self.database.list_concepts(ctx.subject)]
+        previous = [concept["data"] for concept in self.database.list_concepts(ctx.subject)]
+        avoid = [plan["concept"] for plan in previous]
         seasonal = seasonal_context(self.config.seasonal_calendar)
         created: list[str] = []
         ctx.agent(
@@ -313,10 +315,12 @@ class AgentPipeline:
                     count=batch, avoid=avoid, style_guide=style_guide, hint=hint,
                     lessons=adobe_lessons(self.database.adobe_feedback(), examples=True),
                     seasonal=seasonal,
+                    visual_references=[concept_reference(plan, self.config.visual_reference_prompt_chars)
+                                       for plan in previous[-self.config.visual_reference_limit:]],
                 )
             except AgentError as error:
                 self.database.record_agent_run(
-                    ctx.subject, None, "planner", model, INSTRUCTION_VERSION, "failed",
+                    ctx.subject, None, "planner", model, PLANNER_INSTRUCTION_VERSION, "failed",
                     None, str(error), error.duration_ms, error.attempts,
                 )
                 raise
@@ -336,10 +340,11 @@ class AgentPipeline:
                     "Prompt criado pelo agente planejador; geração automática autorizada pelo usuário",
                 )
                 self.database.record_agent_run(
-                    ctx.subject, concept_id, "planner", model, INSTRUCTION_VERSION,
+                    ctx.subject, concept_id, "planner", model, PLANNER_INSTRUCTION_VERSION,
                     "completed", plan.model_dump(mode="json"), "", duration, attempts,
                 )
                 avoid.append(plan.concept)
+                previous.append(plan.model_dump())
                 created.append(concept_id)
                 ctx.event(f"Conceito planejado: {plan.concept}", PLANNER)
             ctx.agent(
