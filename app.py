@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import sqlite3
 import webbrowser
 from datetime import UTC, date, datetime, time
 from pathlib import Path
@@ -34,8 +35,8 @@ from flowapp.agents import AgentError, INSTRUCTION_VERSION, adobe_lessons
 from flowapp.comfy import ComfyError
 from flowapp.config import AppConfig, load_config, save_config
 from flowapp.database import (
-    APPROVAL_PREFIX, Database, DuplicateJobError, InvalidTransition, MAX_WORK_MINUTES,
-    REJECTION_PREFIX, TimerTooLong,
+    APPROVAL_PREFIX, Database, DuplicateJobError, InvalidTransition,
+    MAX_WORK_MINUTES, REJECTION_PREFIX, TimerTooLong,
 )
 from flowapp.images import ImageStore, ImageValidationError
 from flowapp.metrics import (
@@ -44,6 +45,7 @@ from flowapp.metrics import (
 )
 from flowapp.moderation import MODERATION_BY_LABEL, MODERATION_LABELS, moderation_changes
 from flowapp.orchestrator import Orchestrator
+from flowapp.sales_import import parse_adobe_earnings
 from flowapp.pipeline import (
     AgentPipeline, final_upscale, metadata_approval_targets, metadata_targets, upscale_targets,
 )
@@ -2164,6 +2166,234 @@ def render_indicators(
     )
 
 
+def render_adobe_import(orchestrator: Orchestrator, collection_id: str | None) -> None:
+    database = orchestrator.database
+    st.markdown("#### Importar ganhos da Adobe")
+    st.caption(
+        "No portal: Insights → Ganancias → selecione a imagem → baixar CSV (um arquivo por imagem, sem ID). "
+        "Escolha abaixo de qual imagem é cada arquivo. Os arquivos não são gravados em disco; as vendas "
+        "importadas alimentam os lançamentos mensais (marcados como importado) e reimportar não duplica."
+    )
+    for level, text in st.session_state.pop("adobe_import_messages", []):
+        getattr(st, level)(text)
+    nonce = st.session_state.get("adobe_import_nonce", 0)
+    files = st.file_uploader(
+        "Arquivos CSV de ganhos", type=["csv"], accept_multiple_files=True, key=f"adobe_import_files_{nonce}",
+    )
+    plan: list[dict[str, Any]] = []
+    skipped: list[str] = []
+    problems: list[str] = []
+    if files:
+        records = database.list_moderation()
+        record_by_id = {row["id"]: row for row in records}
+        names = {item["id"]: item["name"] for item in database.list_collections()}
+        for file in files:
+            parsed = parse_adobe_earnings(file.getvalue())
+            with st.container(border=True):
+                st.markdown(f"**{file.name}**")
+                columns = st.columns(3)
+                columns[0].metric("Vendas", len(parsed.sales))
+                columns[1].metric("Total", f"{parsed.total:.2f} USD")
+                columns[2].metric("Meses", ", ".join(parsed.months) or "-")
+                if parsed.errors:
+                    st.error("Linhas inválidas (corrija o arquivo; ele não será importado):\n\n" + "\n".join(
+                        f"- {error}" for error in parsed.errors[:20]
+                    ))
+                    skipped.append(f"{file.name}: ignorado, {len(parsed.errors)} linha(s) inválida(s).")
+                    continue
+                if not parsed.sales:
+                    st.warning("Nenhuma venda encontrada neste arquivo.")
+                    skipped.append(f"{file.name}: ignorado, nenhuma venda encontrada.")
+                    continue
+                key = f"adobe_import_{file.file_id}"
+                options = ["__new__"] + [row["id"] for row in records]
+                target = st.selectbox(
+                    "Esta venda é da imagem…", options, key=f"{key}_target",
+                    format_func=lambda value: "Nova imagem fora do fluxo" if value == "__new__" else (
+                        f"{record_by_id[value]['title']} · {record_by_id[value]['adobe_id'] or 'sem ID'} · "
+                        f"{record_by_id[value].get('collection_name') or 'Sem coleção'}"
+                    ),
+                )
+                new_image: dict[str, Any] | None = None
+                record_id = target if target != "__new__" else None
+                if target == "__new__":
+                    fields = st.columns(2)
+                    title = fields[0].text_input("Título da imagem", key=f"{key}_title")
+                    adobe_id = fields[1].text_input("ID Adobe", key=f"{key}_adobe_id")
+                    more = st.columns(2)
+                    coll_options = [""] + list(names)
+                    target_collection = more[0].selectbox(
+                        "Coleção", coll_options, key=f"{key}_collection",
+                        index=coll_options.index(collection_id) if collection_id in coll_options else 0,
+                        format_func=lambda value: names.get(value, "Sem coleção"),
+                    ) or None
+                    submitted_on = more[1].date_input("Data de envio (opcional)", value=None, key=f"{key}_submitted")
+                    reused = database.find_moderation_by_adobe_id(adobe_id)
+                    if reused:
+                        st.info(f"O ID Adobe já existe no registro \"{reused['title']}\": as vendas vão para ele.")
+                        record_id = reused["id"]
+                    elif not title.strip():
+                        st.warning("Informe o título da nova imagem para importar este arquivo.")
+                        problems.append(f"Informe o título da imagem em {file.name}.")
+                        continue
+                    else:
+                        new_image = {
+                            "title": title, "adobe_id": adobe_id.strip(), "collection_id": target_collection,
+                            "submitted_at": submitted_on.isoformat() if submitted_on else None,
+                        }
+                plan.append({
+                    "name": file.name, "sales": parsed.sales, "months": parsed.months,
+                    "record_id": record_id, "new_image": new_image,
+                })
+                notes: list[str] = []
+                if record_id:
+                    already = database.count_existing_adobe_sales(record_id, parsed.sales)
+                    notes.append(f"{len(parsed.sales) - already} venda(s) nova(s) e {already} já importada(s).")
+                    if record_by_id.get(record_id, {}).get("status", "approved") != "approved":
+                        notes.append("A imagem será marcada como aprovada (decided_at na data da primeira venda).")
+                else:
+                    notes.append(f"{len(parsed.sales)} venda(s) nova(s); a imagem será criada como aprovada.")
+                st.caption(" ".join(notes))
+        # Dois arquivos "nova imagem" sem ID e com o mesmo título seriam duas imagens iguais: exige distinguir.
+        seen_titles: dict[str, str] = {}
+        for item in plan:
+            image = item["new_image"]
+            if image and not image["adobe_id"]:
+                title_key = image["title"].strip().casefold()
+                if title_key in seen_titles:
+                    message = (
+                        f"{item['name']} e {seen_titles[title_key]} são \"Nova imagem\" sem ID Adobe e com o mesmo "
+                        f"título (\"{image['title'].strip()}\"): informe o ID Adobe ou mude o título para distingui-las."
+                    )
+                    st.warning(message)
+                    problems.append(message)
+                seen_titles.setdefault(title_key, item["name"])
+        # Conflitos com lançamento manual: uma decisão por (coleção, mês) para o lote inteiro.
+        pairs: dict[tuple[str | None, str | None, str], dict[str, Any]] = {}
+        for item in plan:
+            if item["record_id"]:
+                record = record_by_id.get(item["record_id"], {})
+                pair_key = (record.get("collection_id"), record.get("detached_from"))
+                found = database.import_conflicts(item["months"], record_id=item["record_id"])
+                label = record.get("collection_name") or "Sem coleção"
+                title = record.get("title", "")
+            else:
+                image = item["new_image"]
+                pair_key = (image["collection_id"], None)
+                found = database.import_conflicts(item["months"], collection_id=image["collection_id"])
+                label = names.get(image["collection_id"], "Sem coleção")
+                title = image["title"]
+            item["pair_key"] = pair_key
+            for row in found:
+                pair = pairs.setdefault((*pair_key, row["month"]), {"manual": row, "label": label, "images": {}})
+                imported = [
+                    amount for sale_date, amount in item["sales"] if sale_date.startswith(row["month"])
+                ]
+                count, total = pair["images"].get(title, (0, 0.0))
+                pair["images"][title] = (count + len(imported), total + sum(imported))
+        decisions: dict[tuple[str | None, str | None, str], bool] = {}
+        if pairs:
+            st.markdown("**Conflitos com lançamento manual**")
+            st.caption(
+                "O lançamento manual vale para a coleção inteira no mês; se substituído, passa a refletir apenas "
+                "as vendas importadas das imagens (o valor manual anterior fica guardado na nota). Uma escolha por "
+                "coleção e mês vale para todos os arquivos do lote."
+            )
+        for pair_key, pair in pairs.items():
+            manual = pair["manual"]
+            images = "; ".join(
+                f"{title}: {count} venda(s), {total:.2f} USD" for title, (count, total) in pair["images"].items()
+            )
+            with st.container(border=True):
+                st.markdown(
+                    f"**{pair['label']} · {pair_key[2]}** — manual: {manual['downloads']} downloads, "
+                    f"{manual['revenue']:.2f} {manual['currency']}. Importado neste lote: {images}."
+                )
+                decisions[pair_key] = st.radio(
+                    "O que fazer com o lançamento manual?", [False, True],
+                    key=f"adobe_conflict_{pair_key[0]}_{pair_key[1]}_{pair_key[2]}",
+                    format_func=lambda value: "Substituir o manual pelos dados importados" if value else "Manter o manual",
+                )
+        for item in plan:
+            item["replace_months"] = {
+                month for (cid, det, month), replace in decisions.items()
+                if replace and (cid, det) == item["pair_key"]
+            }
+        if problems:
+            st.warning("Importação desativada: " + " ".join(dict.fromkeys(problems)))
+        elif not plan:
+            st.info("Nenhum arquivo importável: corrija os arquivos com erro.")
+        if st.button("Importar", type="primary", disabled=bool(problems) or not plan, key="adobe_import_run"):
+            messages: list[tuple[str, str]] = [("warning", text) for text in skipped]
+            for item in plan:
+                try:
+                    result = database.import_adobe_sales(
+                        item["record_id"], item["sales"], item["name"],
+                        replace_manual=item["replace_months"], new_image=item["new_image"],
+                    )
+                    extra = ""
+                    if result["created"]:
+                        extra += " Imagem criada como aprovada."
+                    elif result["marked_approved"]:
+                        extra += " Imagem marcada como aprovada."
+                    if result["replaced_months"]:
+                        extra += f" Manual substituído em {', '.join(result['replaced_months'])}."
+                    kept = [month for month in result["conflict_months"] if month not in result["replaced_months"]]
+                    if kept:
+                        extra += f" Manual mantido em {', '.join(kept)}."
+                    messages.append((
+                        "success",
+                        f"{item['name']}: {result['new']} venda(s) nova(s), {result['existing']} já existente(s).{extra}",
+                    ))
+                except (ValueError, KeyError, sqlite3.Error) as error:
+                    messages.append(("error", f"{item['name']}: {error}"))
+            st.session_state["adobe_import_messages"] = messages
+            st.session_state["adobe_import_nonce"] = nonce + 1
+            st.rerun()
+    summary = database.list_adobe_sales_summary()
+    if summary:
+        st.markdown("**Vendas importadas por imagem**")
+        st.dataframe(
+            [
+                {
+                    "imagem": item["title"],
+                    "ID Adobe": item["adobe_id"] or None,
+                    "coleção": (
+                        f"{item['collection_name']} (removida)" if item["detached_from"] and item["collection_name"]
+                        else item["collection_name"] or "Sem coleção"
+                    ),
+                    "vendas": item["sales"],
+                    "receita (USD)": round(item["revenue"], 2),
+                    "primeira venda": item["first_sale"],
+                    "última venda": item["last_sale"],
+                }
+                for item in summary
+            ],
+            width="stretch", hide_index=True,
+        )
+        st.caption("Valores do CSV do portal, em USD, sem conversão nem projeção.")
+        with st.expander("Remover vendas importadas de uma imagem"):
+            st.caption(
+                "Desfaz a importação: apaga as vendas importadas da imagem e recalcula os meses. "
+                "O registro de moderação (aprovada, datas, ID) não é alterado."
+            )
+            choice = st.selectbox(
+                "Imagem", [item["record_id"] for item in summary], key="adobe_remove_choice",
+                format_func=lambda value: next(
+                    f"{item['title']} · {item['adobe_id'] or 'sem ID'} · {item['sales']} venda(s)"
+                    for item in summary if item["record_id"] == value
+                ),
+            )
+            confirmed = st.checkbox("Confirmo remover as vendas importadas desta imagem", key=f"adobe_remove_confirm_{choice}")
+            if st.button("Remover vendas importadas desta imagem", disabled=not confirmed, key="adobe_remove"):
+                try:
+                    removed = database.delete_adobe_sales(choice)
+                    st.session_state["adobe_import_messages"] = [("success", f"{removed} venda(s) importada(s) removida(s).")]
+                    st.rerun()
+                except (ValueError, KeyError, sqlite3.Error) as error:
+                    show_error(error)
+
+
 def render_monthly_sales(
     orchestrator: Orchestrator, collection_id: str | None, sales: list[dict[str, Any]],
 ) -> None:
@@ -2194,11 +2424,15 @@ def render_monthly_sales(
         revenue = value_columns[1].number_input("Receita", min_value=0.0, step=0.1)
         currency = value_columns[2].selectbox("Moeda", ["USD", "EUR", "BRL", "CAD", "AUD"])
         notes = st.text_input("Nota ou fonte (opcional)", max_chars=1000)
+        confirm_import = st.checkbox(
+            "Confirmo editar um mês importado (a linha passa a ser manual)", key="monthly_confirm_import",
+        )
         save = st.form_submit_button("Lançar mês", type="primary")
     if save:
         try:
             database.upsert_monthly_sales(
                 target or None, f"{year}-{month_number:02d}", int(downloads), revenue, currency, notes,
+                confirm_import_override=confirm_import,
             )
             st.session_state["monthly_sales_message"] = "Lançamento mensal salvo."
             st.rerun()
@@ -2209,6 +2443,7 @@ def render_monthly_sales(
             [
                 {
                     "mês": item["month"],
+                    "origem": "importado" if item["source"] == "import" else "manual",
                     "coleção": (
                         f"{item['collection_name']} (removida)" if item["detached_from"] and item["collection_name"]
                         else item["collection_name"] or "Sem coleção"
@@ -2231,6 +2466,10 @@ def render_monthly_sales(
                     f"{item['revenue']:.2f} {item['currency']}"
                     for item in sales if item["id"] == value
                 ),
+            )
+            st.caption(
+                "Se o mês tiver vendas importadas, a linha importada é recriada a partir delas ao excluir; "
+                "para desfazer uma importação use \"Remover vendas importadas de uma imagem\"."
             )
             confirmed = st.checkbox("Confirmo a exclusão deste lançamento", key=f"monthly_delete_confirm_{choice}")
             if st.button("Excluir lançamento mensal", disabled=not confirmed, key="monthly_delete"):
@@ -2256,6 +2495,7 @@ def render_performance(orchestrator: Orchestrator, collection_id: str | None) ->
     ]
     hours_metrics = revenue_per_hour(comparisons, database.work_minutes_by_collection(), sales, archived)
     render_indicators(database, sales, hours_metrics, archived)
+    render_adobe_import(orchestrator, collection_id)
     render_monthly_sales(orchestrator, collection_id, sales)
     with st.expander("Registro avulso (legado)"):
         st.warning(
