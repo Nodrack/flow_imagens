@@ -12,7 +12,7 @@ from typing import Any, get_args
 from flowapp.moderation import local_date, local_noon_utc, today_local
 from flowapp.sales_import import to_micros, with_occurrences
 from flowapp.schemas import (
-    LOCAL_TZ, CollectionBrief, ConceptPlan, ModerationStatus, MonthlySalesEntry, PerformanceEntry,
+    LOCAL_TZ, CollectionBrief, CollectionCostEntry, ConceptPlan, ModerationStatus, MonthlySalesEntry, PerformanceEntry,
     STATE_TRANSITIONS, WorkflowState,
 )
 
@@ -308,6 +308,12 @@ class Database:
                     minutes REAL NOT NULL, manual_minutes REAL NOT NULL,
                     revenue_json TEXT NOT NULL DEFAULT '{}', archived_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS collection_costs (
+                    id TEXT PRIMARY KEY, collection_id TEXT REFERENCES collections(id),
+                    detached_from TEXT, collection_name TEXT NOT NULL DEFAULT '',
+                    cost_date TEXT NOT NULL, amount_micros INTEGER NOT NULL CHECK (amount_micros > 0),
+                    currency TEXT NOT NULL, notes TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS moderation_records (
                     id TEXT PRIMARY KEY,
                     collection_id TEXT REFERENCES collections(id),
@@ -381,6 +387,7 @@ class Database:
                 connection.execute("DROP TABLE adobe_sales_old")
             connection.execute(_ADOBE_SALES_DDL)
             for table, extra in (
+                ("archived_work_minutes", (("cost_json", "TEXT NOT NULL DEFAULT '{}'"),)),
                 ("monthly_sales", (
                     ("detached_from", "TEXT"),
                     ("source", "TEXT NOT NULL DEFAULT 'manual' CHECK (source IN ('manual', 'import'))"),
@@ -605,6 +612,10 @@ class Database:
                         )
                 connection.execute("DELETE FROM pipeline_runs WHERE collection_id = ?", (collection_id,))
             self._archive_work(connection, collection_id, collection["name"])
+            connection.execute(
+                "UPDATE collection_costs SET detached_from = collection_id, collection_name = ?, "
+                "collection_id = NULL WHERE collection_id = ?", (collection["name"], collection_id),
+            )
             connection.execute(
                 "DELETE FROM performance_records WHERE collection_id = ?", (collection_id,)
             )
@@ -1336,11 +1347,17 @@ class Database:
                 "WHERE collection_id = ? GROUP BY revenue_currency", (collection_id,),
             )
         }
-        if minutes or manual or revenue:
+        costs = {
+            row["cost_currency"]: row["total"] for row in connection.execute(
+                "SELECT cost_currency, SUM(user_cost) AS total FROM performance_records "
+                "WHERE collection_id = ? AND user_cost > 0 GROUP BY cost_currency", (collection_id,),
+            )
+        }
+        if minutes or manual or revenue or costs:
             connection.execute(
                 "INSERT INTO archived_work_minutes(detached_from, collection_name, minutes, "
-                "manual_minutes, revenue_json, archived_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (collection_id, name, minutes, manual, json.dumps(revenue), utc_now()),
+                "manual_minutes, revenue_json, cost_json, archived_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (collection_id, name, minutes, manual, json.dumps(revenue), json.dumps(costs), utc_now()),
             )
 
     def list_archived_work(self) -> list[dict[str, Any]]:
@@ -1348,7 +1365,8 @@ class Database:
         with self.connect() as connection:
             rows = connection.execute("SELECT * FROM archived_work_minutes").fetchall()
         return [
-            {**dict(row), "revenue": json.loads(row["revenue_json"] or "{}")} for row in rows
+            {**dict(row), "revenue": json.loads(row["revenue_json"] or "{}"),
+             "costs": json.loads(row["cost_json"] or "{}")} for row in rows
         ]
 
     # --- Downloads e receita mensais -----------------------------------------------------
@@ -1837,3 +1855,54 @@ class Database:
                 "(moderation_record_id, path, sha256, created_at) VALUES (?, ?, ?, ?)",
                 (record_id, str(path), sha256, utc_now()),
             )
+
+    def add_collection_cost(self, collection_id: str, entry: CollectionCostEntry) -> str:
+        entry = CollectionCostEntry.model_validate(entry.model_dump())
+        micros = to_micros(entry.amount)
+        if micros <= 0:
+            raise ValueError("O valor do custo deve ser de pelo menos 0,000001.")
+        cost_id = str(uuid.uuid4())
+        with self.connect() as connection:
+            if not connection.execute("SELECT 1 FROM collections WHERE id = ?", (collection_id,)).fetchone():
+                raise KeyError("Coleção não encontrada.")
+            connection.execute(
+                "INSERT INTO collection_costs(id, collection_id, cost_date, amount_micros, currency, notes, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (cost_id, collection_id, entry.cost_date.isoformat(), micros, entry.currency, entry.notes, utc_now()),
+            )
+        return cost_id
+
+    def list_collection_costs(self, collection_id: str | EllipsisType = ...) -> list[dict[str, Any]]:
+        query = (
+            "SELECT cost.*, COALESCE(col.name, cost.collection_name) AS name FROM collection_costs cost "
+            "LEFT JOIN collections col ON col.id = cost.collection_id"
+        )
+        params = ()
+        if collection_id is not ...:
+            query += " WHERE cost.collection_id = ?"
+            params = (collection_id,)
+        with self.connect() as connection:
+            rows = connection.execute(query + " ORDER BY cost_date DESC, created_at DESC", params).fetchall()
+        return [{**dict(row), "amount": row["amount_micros"] / 1_000_000, "source": "manual"} for row in rows]
+
+    def delete_collection_cost(self, cost_id: str, collection_id: str) -> None:
+        with self.connect() as connection:
+            cursor = connection.execute("DELETE FROM collection_costs WHERE id = ? AND collection_id = ?",
+                                        (cost_id, collection_id))
+            if not cursor.rowcount:
+                raise KeyError("Custo não encontrado nesta coleção.")
+
+    def costs_for_metrics(self) -> list[dict[str, Any]]:
+        rows = self.list_collection_costs()
+        with self.connect() as connection:
+            legacy = connection.execute(
+                "SELECT collection_id, cost_currency AS currency, SUM(user_cost) AS amount "
+                "FROM performance_records WHERE user_cost > 0 GROUP BY collection_id, cost_currency"
+            ).fetchall()
+        rows.extend({**dict(row), "source": "legacy"} for row in legacy)
+        for archive in self.list_archived_work():
+            rows.extend({"collection_id": None, "detached_from": archive["detached_from"],
+                         "collection_name": archive["collection_name"], "currency": currency,
+                         "amount": amount, "source": "legacy_archived"}
+                        for currency, amount in archive["costs"].items())
+        return rows

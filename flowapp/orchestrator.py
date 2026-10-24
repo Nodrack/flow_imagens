@@ -39,13 +39,16 @@ class Orchestrator:
         self.gpu = GpuCoordinator(
             release={
                 "llm": lambda: self.lmstudio.unload_all_models(),
-                "comfy": lambda: self.comfy.free_memory(),
+                "comfy": self._free_comfy_memory,
             },
             free_vram=config.free_vram_between_phases,
         )
+        self._generation_endpoint = config.comfy_url_for("generation")
         self.comfy = ComfyUIClient(
-            config.comfy_base_url, config.request_timeout_seconds, gpu=self.gpu,
+            self._generation_endpoint, config.request_timeout_seconds, gpu=self.gpu,
         )
+        self._comfy_clients = {self._generation_endpoint: self.comfy}
+        self.comfy_for("upscale")
         self.lmstudio = LMStudioClient(
             config.lmstudio_base_url,
             config.request_timeout_seconds,
@@ -55,8 +58,32 @@ class Orchestrator:
         )
 
     def close(self) -> None:
-        self.comfy.close()
+        for client in {id(value): value for value in [self.comfy, *self._comfy_clients.values()]}.values():
+            client.close()
         self.lmstudio.close()
+
+    def comfy_for(self, stage: str, endpoint: str | None = None) -> ComfyUIClient:
+        url = (endpoint if endpoint is not None else self.config.comfy_url_for(stage)).rstrip("/")
+        if url == self._generation_endpoint:
+            return self.comfy
+        if url not in self._comfy_clients:
+            self._comfy_clients[url] = ComfyUIClient(url, self.config.request_timeout_seconds, gpu=self.gpu)
+        return self._comfy_clients[url]
+
+    def job_comfy(self, job: dict) -> ComfyUIClient:
+        # Legacy jobs were created on the shared base URL, before per-stage routing existed.
+        endpoint = job["payload"].get("comfy_base_url") or self.config.comfy_base_url
+        return self.comfy_for(job["kind"], endpoint)
+
+    def _free_comfy_memory(self) -> None:
+        errors = []
+        for url in list(self._comfy_clients):
+            try:
+                self.comfy_for("generation", url).free_memory()
+            except ComfyError as error:
+                errors.append(f"{url}: {error}")
+        if errors:
+            raise ComfyError("; ".join(errors))
 
     def ensure_normal(self, collection_id: str) -> None:
         """Recusa operações com agentes/ComfyUI na coleção das imagens enviadas fora do fluxo."""
@@ -110,6 +137,7 @@ class Orchestrator:
         payload = job["payload"]
         profile = ComfyWorkflowProfile.model_validate(payload["profile"])
         prompt_id = job["comfy_prompt_id"]
+        comfy = self.job_comfy(job)
         started = time.perf_counter()
         if progress:
             progress(f"Conferindo fila/histórico do ComfyUI ({prompt_id[:8]}).")
@@ -117,9 +145,9 @@ class Orchestrator:
             try:
                 # Dentro do try: um workflow rejeitado no envio também marca o trabalho como falho,
                 # em vez de deixá-lo "queued" para sempre.
-                self.comfy.submit_or_reconcile(prompt_id, profile, payload["values"])
+                comfy.submit_or_reconcile(prompt_id, profile, payload["values"])
                 self.database.update_job(job["id"], "running")
-                images = self.comfy.wait_for_outputs(
+                images = comfy.wait_for_outputs(
                     prompt_id,
                     profile.output_node_ids,
                     self.config.generation_timeout_seconds,
@@ -129,7 +157,7 @@ class Orchestrator:
                 for image in images:
                     if progress:
                         progress(f"Recuperando imagem {image.get('filename', '')}.")
-                    raw = self.comfy.fetch_output(image)
+                    raw = comfy.fetch_output(image)
                     asset_id, asset = self.images._register(
                         payload["collection_id"],
                         payload["concept_id"],
@@ -186,7 +214,9 @@ class Orchestrator:
         profile = load_profile(root, "generation")
         if profile is None:
             raise ValueError("Importe e valide um workflow API de geração primeiro.")
-        errors = self.comfy.validate_profile(profile)
+        endpoint = self.config.comfy_url_for("generation")
+        comfy = self.comfy_for("generation", endpoint)
+        errors = comfy.validate_profile(profile)
         if errors:
             raise ValueError("Mapeamento do workflow inválido: " + " ".join(errors))
         batch_id = str(uuid.uuid4())
@@ -210,6 +240,7 @@ class Orchestrator:
                 "values": values,
                 "role": "candidate",
                 "folder": "originals",
+                "comfy_base_url": endpoint,
             }
             jobs_to_create.append((key, payload))
         job_ids = self.database.create_job_batch(
@@ -345,7 +376,9 @@ class Orchestrator:
         profile = load_profile(root, "inpainting")
         if profile is None:
             raise ValueError("Importe um workflow API de inpainting/correção primeiro.")
-        issues = self.comfy.validate_profile(profile)
+        endpoint = self.config.comfy_url_for("generation")
+        comfy = self.comfy_for("generation", endpoint)
+        issues = comfy.validate_profile(profile)
         if issues:
             raise ValueError("Mapeamento do workflow inválido: " + " ".join(issues))
 
@@ -355,7 +388,7 @@ class Orchestrator:
         edit_instruction = self._correction_instruction(
             collection_id, concept, correction_prompt, model_id, progress,
         )
-        uploaded = self.comfy.upload_image(uploaded_path)
+        uploaded = comfy.upload_image(uploaded_path)
         values = {
             "image": uploaded,
             "prompt": edit_instruction,
@@ -375,6 +408,7 @@ class Orchestrator:
             "values": values,
             "role": "correction",
             "folder": "corrections",
+            "comfy_base_url": endpoint,
         }
         job_ids = self.database.create_job_batch(
             collection_id, concept["id"], "correction", [(key, payload)]
@@ -427,7 +461,7 @@ class Orchestrator:
         for job in self.database.list_recoverable_jobs(collection_id):
             if job["concept_id"] != concept_id:
                 continue
-            cancel_result = self.comfy.cancel(job["comfy_prompt_id"])
+            cancel_result = self.job_comfy(job).cancel(job["comfy_prompt_id"])
             if cancel_result == "requested" or (
                 cancel_result == "not_found" and job["status"] == "queued"
             ):
@@ -488,6 +522,8 @@ class Orchestrator:
         self.ensure_normal(collection_id)
         if concept["state"] != WorkflowState.SELECTED.value:
             raise ValueError("Selecione um candidato antes do upscale.")
+        endpoint = self.config.comfy_url_for("upscale")
+        comfy = self.comfy_for("upscale", endpoint)
         profile = load_profile(self.images.collection_path(collection_id), "upscale")
         if profile is None:
             raise ValueError("Importe e valide um workflow API de upscale primeiro.")
@@ -504,10 +540,10 @@ class Orchestrator:
                     **profile.mappings,
                     "multiplier": WorkflowInputRef(node_id=multiplier[0], input_name=multiplier[1]),
                 }})
-        errors = self.comfy.validate_profile(profile)
+        errors = comfy.validate_profile(profile)
         if errors:
             raise ValueError("Mapeamento do workflow inválido: " + " ".join(errors))
-        uploaded = self.comfy.upload_image(Path(asset["path"]))
+        uploaded = comfy.upload_image(Path(asset["path"]))
         values = {
             "image": uploaded, "filename_prefix": f"flow/upscale-{concept['id'][:8]}",
             "multiplier": self.config.upscale_factor,
@@ -525,6 +561,7 @@ class Orchestrator:
             "values": values,
             "role": "upscaled",
             "folder": "upscaled",
+            "comfy_base_url": endpoint,
         }
         job_ids = self.database.create_job_batch(
             collection_id, concept["id"], "upscale", [(key, payload)]

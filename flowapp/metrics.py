@@ -91,6 +91,37 @@ def format_hours(hours: float) -> str:
     return f"{total_minutes // 60}h{total_minutes % 60:02d}"
 
 
+def result_after_costs(hours_metrics: dict[str, Any], cost_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Revenue minus reported costs in each currency; no exchange rates or consolidated profit."""
+    costs: dict[str | None, dict[str, float]] = {}
+    for row in cost_rows:
+        currencies = costs.setdefault(collection_key(row), {})
+        currency = row["currency"]
+        currencies[currency] = currencies.get(currency, 0.0) + float(row["amount"])
+
+    def cell(revenue, cost, hours):
+        net = revenue - cost
+        return {"revenue": revenue, "cost": cost, "result": net,
+                "per_hour": net/hours if hours > 0 else None}
+
+    collections, totals = {}, {}
+    for key in hours_metrics["collections"].keys() | costs.keys():
+        gross = hours_metrics["collections"].get(key, {"hours": 0, "by_currency": {}})
+        by_currency = {}
+        for currency in gross["by_currency"].keys() | costs.get(key, {}).keys():
+            revenue = gross["by_currency"].get(currency, {}).get("revenue", 0.0)
+            cost = costs.get(key, {}).get(currency, 0.0)
+            by_currency[currency] = cell(revenue, cost, gross["hours"])
+            total = totals.setdefault(currency, {"revenue": 0.0, "cost": 0.0})
+            total["revenue"] += revenue
+            total["cost"] += cost
+        collections[key] = {"hours": gross["hours"], "by_currency": by_currency}
+    total_hours = hours_metrics["total"]["hours"]
+    return {"collections": collections, "total": {"hours": total_hours,
+            "by_currency": {currency: cell(values["revenue"], values["cost"], total_hours)
+                            for currency, values in sorted(totals.items())}}}
+
+
 def format_per_hour(value: float | None, currency: str) -> str:
     return "-" if value is None else f"{value:.2f} {currency}/h"
 

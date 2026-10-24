@@ -65,8 +65,10 @@ Validação local em 24/10/2026: os dois pares do aceite recebem alerta de palet
 - [x] O planejador passa a pedir espaço para texto e variação real de composição, cor e cenário entre conceitos.
 
 ### 8. GPU na nuvem para as finalistas
-- [ ] Permitir uma URL de ComfyUI diferente por etapa (geração, ampliação), para usar uma GPU alugada só nas imagens finais.
-- [ ] Registrar o custo informado por coleção, para entrar na conta da receita por hora.
+- [x] Permitir uma URL de ComfyUI diferente por etapa (geração, ampliação), para usar uma GPU alugada só nas imagens finais.
+- [x] Registrar o custo informado por coleção, para entrar na conta da receita por hora.
+
+Custos entram no resultado após custos por hora, com a receita/hora preservada e as moedas separadas. URLs ficam registradas por trabalho para retomada/cancelamento no mesmo destino.
 
 ## P2. Distribuição e nome
 

@@ -5,7 +5,8 @@ import os
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from urllib.parse import urlsplit
 
 from flowapp.schemas import ExportRules
 from flowapp.quality import QualityRules
@@ -18,6 +19,8 @@ class AppConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     comfy_base_url: str = "http://127.0.0.1:8188"
+    comfy_generation_url: str = ""
+    comfy_upscale_url: str = ""
     lmstudio_base_url: str = "http://127.0.0.1:1234"
     planner_model: str = ""
     vision_model: str = ""
@@ -49,9 +52,31 @@ class AppConfig(BaseModel):
     # Cronômetro de horas que passar disso é tratado como esquecido e pede os minutos reais.
     timer_max_hours: float = Field(default=12.0, ge=1, le=24)
 
+    @field_validator("comfy_base_url", "comfy_generation_url", "comfy_upscale_url")
+    @classmethod
+    def validate_comfy_url(cls, value: str, info) -> str:
+        value = value.strip().rstrip("/")
+        if not value:
+            if info.field_name == "comfy_base_url":
+                raise ValueError("Informe a URL base do ComfyUI.")
+            return value
+        parts = urlsplit(value)
+        if parts.scheme not in {"http", "https"} or not parts.hostname:
+            raise ValueError("Use uma URL HTTP/HTTPS válida para o ComfyUI.")
+        if parts.username or parts.password or parts.query or parts.fragment:
+            raise ValueError("A URL do ComfyUI deve ser a base do serviço, sem credenciais, query ou fragmento.")
+        _ = parts.port  # Reject invalid port numbers before any request.
+        return value
+
+    def comfy_url_for(self, stage: str) -> str:
+        selected = self.comfy_upscale_url if stage == "upscale" else self.comfy_generation_url
+        return selected or self.comfy_base_url
+
 
 ENV_CONFIG = {
     "FLOW_COMFY_BASE_URL": "comfy_base_url",
+    "FLOW_COMFY_GENERATION_URL": "comfy_generation_url",
+    "FLOW_COMFY_UPSCALE_URL": "comfy_upscale_url",
     "FLOW_LMSTUDIO_BASE_URL": "lmstudio_base_url",
     "FLOW_PLANNER_MODEL": "planner_model",
     "FLOW_VISION_MODEL": "vision_model",

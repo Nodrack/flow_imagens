@@ -49,7 +49,7 @@ from flowapp.seasonal import (
 )
 from flowapp.metrics import (
     approval_rate, approved_per_week, collection_key, downloads_per_approved, format_hours,
-    format_per_hour, revenue_per_hour,
+    format_per_hour, revenue_per_hour, result_after_costs,
 )
 from flowapp.moderation import (
     MODERATION_BY_LABEL, MODERATION_LABELS, local_date, moderation_changes, moderation_scopes,
@@ -70,6 +70,7 @@ from flowapp.profiles import (
 from flowapp.schemas import (
     LOCAL_TZ,
     CollectionBrief,
+    CollectionCostEntry,
     ComfyWorkflowProfile,
     ConceptPlan,
     MetadataSuggestion,
@@ -159,28 +160,29 @@ def model_options(models: list[dict[str, Any]], vision: bool | None = None) -> l
 
 
 def render_diagnostics(config: AppConfig, orchestrator: Orchestrator) -> None:
-    st.subheader("Diagnóstico local")
+    st.subheader("Diagnóstico dos serviços")
     st.caption("A consulta abaixo só lê os serviços; não carrega modelos nem executa workflows.")
-    if st.button("Verificar serviços locais", icon=":material/health_and_safety:"):
-        with st.spinner("Consultando serviços locais…"):
-            try:
-                stats = orchestrator.comfy.system_stats()
-                system = stats.get("system", {})
-                st.success(
-                    f"ComfyUI conectado · versão {system.get('comfyui_version', 'não informada')} "
-                    f"· Python {system.get('python_version', 'não informado').split()[0]}"
-                )
-                for device in stats.get("devices", []):
-                    total_gib = device.get("vram_total", 0) / 1024**3
-                    free_gib = device.get("vram_free", 0) / 1024**3
-                    st.write(f"GPU: {device.get('name')} · VRAM {free_gib:.1f}/{total_gib:.1f} GiB livres")
-                queue = orchestrator.comfy.queue()
-                st.write(
-                    f"Fila ComfyUI: {len(queue.get('queue_running', []))} executando, "
-                    f"{len(queue.get('queue_pending', []))} aguardando."
-                )
-            except ComfyError as error:
-                st.warning(f"ComfyUI: {error}")
+    if st.button("Verificar serviços", icon=":material/health_and_safety:"):
+        with st.spinner("Consultando serviços…"):
+            checked = set()
+            for stage, label in [("generation", "Geração/correções"), ("upscale", "Ampliação")]:
+                endpoint = config.comfy_url_for(stage)
+                if endpoint in checked:
+                    continue
+                checked.add(endpoint)
+                try:
+                    client = orchestrator.comfy_for(stage)
+                    stats = client.system_stats()
+                    system = stats.get("system", {})
+                    st.success(f"ComfyUI · {label} · {endpoint} · versão {system.get('comfyui_version', 'não informada')}")
+                    for device in stats.get("devices", []):
+                        total_gib = device.get("vram_total", 0) / 1024**3
+                        free_gib = device.get("vram_free", 0) / 1024**3
+                        st.write(f"GPU: {device.get('name')} · VRAM {free_gib:.1f}/{total_gib:.1f} GiB livres")
+                    queue = client.queue()
+                    st.write(f"Fila: {len(queue.get('queue_running', []))} executando, {len(queue.get('queue_pending', []))} aguardando.")
+                except ComfyError as error:
+                    st.warning(f"ComfyUI · {label}: {error}")
             models = model_list(config.lmstudio_base_url)
             if models:
                 st.success(f"LM Studio conectado · {len(models)} modelos descobertos")
@@ -285,6 +287,9 @@ def render_settings(config: AppConfig) -> AppConfig:
     vision_options = model_options(models, vision=True)
     with st.form("settings"):
         comfy_url = st.text_input("URL base do ComfyUI", config.comfy_base_url)
+        comfy_generation_url = st.text_input("ComfyUI para geração e correções (vazio = URL base)", config.comfy_generation_url)
+        comfy_upscale_url = st.text_input("ComfyUI para ampliação (vazio = URL base)", config.comfy_upscale_url)
+        st.caption("A ampliação envia a imagem escolhida ao servidor configurado e baixa o resultado. Instale nele os modelos e nós do workflow. A URL pode ser de uma GPU alugada ou de um túnel; contratar e desligar a instância continua manual.")
         lm_url = st.text_input("URL base do LM Studio", config.lmstudio_base_url)
         planner_choices = [""] + (planner_options or ([config.planner_model] if config.planner_model else []))
         vision_choices = [""] + (vision_options or ([config.vision_model] if config.vision_model else []))
@@ -419,8 +424,16 @@ def render_settings(config: AppConfig) -> AppConfig:
         except (ValueError, TypeError, KeyError) as error:
             st.error(f"Modelos de briefing inválidos; a configuração não foi salva: {error}")
             return config
+        try:
+            AppConfig(comfy_base_url=comfy_url, comfy_generation_url=comfy_generation_url,
+                      comfy_upscale_url=comfy_upscale_url)
+        except ValidationError:
+            st.error("Endereço ComfyUI inválido; a configuração não foi salva. Use uma URL base HTTP/HTTPS sem credenciais, query ou fragmento.")
+            return config
         new_config = AppConfig(
             comfy_base_url=comfy_url,
+            comfy_generation_url=comfy_generation_url,
+            comfy_upscale_url=comfy_upscale_url,
             lmstudio_base_url=lm_url,
             planner_model=planner,
             vision_model=vision,
@@ -1309,7 +1322,7 @@ def render_workflow_import(orchestrator: Orchestrator, collection_id: str | None
             node_ids = list(workflow)
             info = {}
             try:
-                info = orchestrator.comfy.object_info()
+                info = orchestrator.comfy_for(kind).object_info()
             except ComfyError as error:
                 st.warning(f"Não foi possível consultar tipos de nó agora: {error}. A validação será feita ao salvar/usar.")
             output_nodes = [
@@ -1402,7 +1415,7 @@ def render_workflow_import(orchestrator: Orchestrator, collection_id: str | None
                         kind=kind, workflow=workflow, mappings=mappings,
                         output_node_ids=selected_outputs,
                     )
-                    issues = orchestrator.comfy.validate_profile(profile)
+                    issues = orchestrator.comfy_for(kind).validate_profile(profile)
                     if issues:
                         for issue in issues:
                             st.error(issue)
@@ -1457,7 +1470,7 @@ def render_workflow_import(orchestrator: Orchestrator, collection_id: str | None
                             **generation_profile.model_dump(mode="json"),
                             "mappings": mappings,
                         })
-                        issues = orchestrator.comfy.validate_profile(corrected_profile)
+                        issues = orchestrator.comfy_for(kind).validate_profile(corrected_profile)
                         if issues:
                             for issue in issues:
                                 st.error(issue)
@@ -2772,6 +2785,64 @@ def render_monthly_sales(
                     show_error(error)
 
 
+def render_collection_costs(orchestrator: Orchestrator, collection_id: str | None, hours_metrics: dict) -> None:
+    database = orchestrator.database
+    st.markdown("#### Custos por coleção")
+    st.caption("Registre o gasto efetivo da GPU ou outro custo da coleção. Os custos do registro avulso também entram na conta; lance cada gasto uma única vez.")
+    if collection_id:
+        with st.form("collection_cost_entry", clear_on_submit=True):
+            cost_date = st.date_input("Data do custo", value=today_local(), max_value=today_local())
+            amount = st.number_input("Valor do custo", min_value=0.0, max_value=1_000_000_000.0, step=0.1)
+            currency = st.text_input("Moeda do custo (3 letras)", value="USD", max_chars=3)
+            notes = st.text_input("Descrição ou fornecedor do custo", max_chars=1000)
+            save = st.form_submit_button("Registrar custo")
+        if save:
+            try:
+                entry = CollectionCostEntry(cost_date=cost_date, amount=amount, currency=currency.strip().upper(), notes=notes)
+                database.add_collection_cost(collection_id, entry)
+                st.rerun()
+            except (ValidationError, ValueError, KeyError) as error:
+                show_error(error)
+        entries = database.list_collection_costs(collection_id)
+        if entries:
+            st.dataframe([{"Data": row["cost_date"], "Valor": row["amount"], "Moeda": row["currency"],
+                           "Descrição": row["notes"]} for row in entries], hide_index=True)
+            with st.expander("Corrigir um lançamento de custo"):
+                selected = st.selectbox("Custo a excluir", [row["id"] for row in entries],
+                    format_func=lambda value: next(f"{row['cost_date']} · {row['amount']:.2f} {row['currency']} · {row['notes']}"
+                                                  for row in entries if row["id"] == value))
+                confirmed = st.checkbox("Confirmo a exclusão deste custo", key=f"delete_cost_confirm_{selected}")
+                if st.button("Excluir custo", disabled=not confirmed):
+                    database.delete_collection_cost(selected, collection_id)
+                    st.rerun()
+    else:
+        st.caption("Selecione uma coleção para registrar um custo.")
+
+    result = result_after_costs(hours_metrics, database.costs_for_metrics())
+    labels = {row["id"]: row["name"] for row in database.list_collections()}
+    labels.update({f"removida:{row['detached_from']}": f"{row['collection_name']} (removida)"
+                   for row in database.list_archived_work()})
+    for row in database.list_collection_costs():
+        if row.get("detached_from"):
+            labels[f"removida:{row['detached_from']}"] = f"{row['collection_name']} (removida)"
+    summary = []
+    for key, item in result["collections"].items():
+        for currency, values in sorted(item["by_currency"].items()):
+            summary.append({"Coleção": labels.get(key, "Sem coleção"), "Moeda": currency,
+                            "Receita": values["revenue"], "Custos informados": values["cost"],
+                            "Resultado após custos": values["result"], "Horas": format_hours(item["hours"]),
+                            "Resultado/hora": format_per_hour(values["per_hour"], currency)})
+    if summary:
+        st.markdown("#### Resultado após custos informados, por coleção")
+        st.dataframe(sorted(summary, key=lambda row: (row["Coleção"], row["Moeda"])), hide_index=True)
+        st.markdown("#### Resultado após custos informados, total por moeda")
+        st.dataframe([{"Moeda": currency, "Receita": values["revenue"], "Custos informados": values["cost"],
+                       "Resultado após custos": values["result"], "Horas totais": format_hours(result["total"]["hours"]),
+                       "Resultado/hora": format_per_hour(values["per_hour"], currency)}
+                      for currency, values in result["total"]["by_currency"].items()], hide_index=True)
+    st.caption("Receita/hora = receita ÷ horas; resultado/hora = (receita − custos informados) ÷ horas. Sem horas aparece ‘-’. São saldos separados por moeda, sem conversão ou resultado consolidado entre moedas.")
+
+
 def render_performance(orchestrator: Orchestrator, collection_id: str | None) -> None:
     st.subheader("Resultados e custos informados")
     st.caption(
@@ -2788,6 +2859,7 @@ def render_performance(orchestrator: Orchestrator, collection_id: str | None) ->
     render_indicators(database, sales, hours_metrics, archived)
     render_adobe_import(orchestrator, collection_id)
     render_monthly_sales(orchestrator, collection_id, sales)
+    render_collection_costs(orchestrator, collection_id, hours_metrics)
     with st.expander("Registro avulso (legado)"):
         st.warning(
             "A receita lançada aqui também entra na receita/hora, somada aos lançamentos mensais. "
