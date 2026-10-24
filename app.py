@@ -43,7 +43,10 @@ from flowapp.metrics import (
     approval_rate, approved_per_week, collection_key, downloads_per_approved, format_hours,
     format_per_hour, revenue_per_hour,
 )
-from flowapp.moderation import MODERATION_BY_LABEL, MODERATION_LABELS, moderation_changes
+from flowapp.moderation import (
+    MODERATION_BY_LABEL, MODERATION_LABELS, local_date, moderation_changes, moderation_scopes,
+    to_date, today_local,
+)
 from flowapp.orchestrator import Orchestrator
 from flowapp.sales_import import parse_adobe_earnings
 from flowapp.pipeline import (
@@ -447,40 +450,47 @@ def render_collection_overview(
             ]
             open_timer = database.open_timer()
             timer_blocks = bool(open_timer and open_timer["collection_id"] == collection_id)
-            with st.expander("Remover coleção", expanded=False):
-                st.warning(
-                    "Esta ação permanente apaga a coleção, seus conceitos, imagens, workflows, "
-                    "histórico e métricas locais. Não remove arquivos fora da pasta desta coleção."
+            is_external = collection.get("kind") == "external"
+            if is_external:
+                st.caption(
+                    "Remoção indisponível: esta é a coleção das imagens enviadas fora do fluxo e guarda o "
+                    "registro dessas imagens."
                 )
-                if active_jobs:
-                    st.error(
-                        f"Remoção bloqueada: há {len(active_jobs)} trabalho(s) ComfyUI ativos. "
-                        "Aguarde a conclusão ou cancele-os antes."
+            else:
+                with st.expander("Remover coleção", expanded=False):
+                    st.warning(
+                        "Esta ação permanente apaga a coleção, seus conceitos, imagens, workflows, "
+                        "histórico e métricas locais. Não remove arquivos fora da pasta desta coleção."
                     )
-                if timer_blocks:
-                    st.error(
-                        "Remoção bloqueada: há um cronômetro de horas aberto nesta coleção. "
-                        "Pare ou descarte-o na aba Resultados ou na barra lateral."
+                    if active_jobs:
+                        st.error(
+                            f"Remoção bloqueada: há {len(active_jobs)} trabalho(s) ComfyUI ativos. "
+                            "Aguarde a conclusão ou cancele-os antes."
+                        )
+                    if timer_blocks:
+                        st.error(
+                            "Remoção bloqueada: há um cronômetro de horas aberto nesta coleção. "
+                            "Pare ou descarte-o na aba Resultados ou na barra lateral."
+                        )
+                    confirmation = st.text_input(
+                        f"Digite {collection['name']} para confirmar",
+                        key=f"delete_collection_confirm_{collection_id}",
                     )
-                confirmation = st.text_input(
-                    f"Digite {collection['name']} para confirmar",
-                    key=f"delete_collection_confirm_{collection_id}",
-                )
-                delete_clicked = st.button(
-                    "Remover permanentemente",
-                    type="secondary",
-                    disabled=bool(active_jobs) or timer_blocks or confirmation != collection["name"],
-                    key=f"delete_collection_{collection_id}",
-                )
-                if delete_clicked:
-                    try:
-                        orchestrator.delete_collection(collection_id)
-                        if active_id == collection_id:
-                            st.session_state.pop("active_collection", None)
-                        st.success(f"Coleção {collection['name']} removida.")
-                        st.rerun()
-                    except (KeyError, ValueError, OSError) as error:
-                        show_error(error)
+                    delete_clicked = st.button(
+                        "Remover permanentemente",
+                        type="secondary",
+                        disabled=bool(active_jobs) or timer_blocks or confirmation != collection["name"],
+                        key=f"delete_collection_{collection_id}",
+                    )
+                    if delete_clicked:
+                        try:
+                            orchestrator.delete_collection(collection_id)
+                            if active_id == collection_id:
+                                st.session_state.pop("active_collection", None)
+                            st.success(f"Coleção {collection['name']} removida.")
+                            st.rerun()
+                        except (KeyError, ValueError, OSError) as error:
+                            show_error(error)
 
 
 AGENT_STATE_ICONS = {
@@ -944,6 +954,13 @@ def render_evaluation(orchestrator: Orchestrator, config: AppConfig, collection_
     notice = st.session_state.pop("new_collection_notice", None)
     if notice:
         st.success(notice)
+    if collection.get("kind") == "external":
+        st.info(
+            "Esta é a coleção das imagens enviadas fora do fluxo. Os agentes (planejamento, geração, "
+            "revisão) não rodam nela: use a aba Registro para cadastrar essas imagens e a aba "
+            "Resultados para importar os ganhos."
+        )
+        return
 
     models = render_agent_models(database, config, collection_id)
     pipeline = current_pipeline()
@@ -2073,6 +2090,26 @@ def render_work_hours(orchestrator: Orchestrator, collection_id: str) -> None:
                         show_error(error)
 
 
+def current_external_id(database: Database) -> str:
+    """Id da coleção externa, consultado uma vez por execução (o main guarda em session_state)."""
+    value = st.session_state.get("external_collection_run_id")
+    if value is None:
+        value = st.session_state["external_collection_run_id"] = database.external_collection_id()
+    return value
+
+
+def external_collection_notice(database: Database, collection_id: str | None) -> bool:
+    """Mostra o aviso e devolve True quando a coleção ativa é a das imagens fora do fluxo."""
+    collection = database.get_collection(collection_id) if collection_id else None
+    if collection and collection.get("kind") == "external":
+        st.info(
+            "Esta é a coleção das imagens enviadas fora do fluxo: não há conceitos, imagens nem agentes "
+            "aqui. Use a aba Registro para cadastrar essas imagens e a aba Resultados para importar os ganhos."
+        )
+        return True
+    return False
+
+
 def collection_labels(
     database: Database, *row_groups: list[dict[str, Any]],
 ) -> dict[str | None, str]:
@@ -2083,7 +2120,7 @@ def collection_labels(
             key = collection_key({"collection_id": row.get("collection_id"), "detached_from": row.get("detached_from")})
             if key and key not in labels:
                 labels[key] = f"{row.get('collection_name') or 'Coleção'} (removida)"
-    labels[None] = "Sem coleção"
+    labels[None] = "Sem vínculo"
     return labels
 
 
@@ -2160,7 +2197,7 @@ def render_indicators(
         )
     st.caption(
         "Valores informados manualmente e conferidos no painel da Adobe; sem conversão de moedas nem projeção. "
-        "\"Sem coleção\" reúne imagens e lançamentos fora do fluxo; coleções removidas aparecem pelo nome, "
+        "\"Sem vínculo\" reúne registros antigos sem coleção; coleções removidas aparecem pelo nome, "
         "com as horas arquivadas na remoção. Aprovada sem data de decisão usa a data de envio ou da "
         "última atualização. Células vazias significam sem dados (sem decisões, sem horas ou sem aprovadas)."
     )
@@ -2211,7 +2248,7 @@ def render_adobe_import(orchestrator: Orchestrator, collection_id: str | None) -
                     "Esta venda é da imagem…", options, key=f"{key}_target",
                     format_func=lambda value: "Nova imagem fora do fluxo" if value == "__new__" else (
                         f"{record_by_id[value]['title']} · {record_by_id[value]['adobe_id'] or 'sem ID'} · "
-                        f"{record_by_id[value].get('collection_name') or 'Sem coleção'}"
+                        f"{record_by_id[value].get('collection_name') or 'Sem vínculo'}"
                     ),
                 )
                 new_image: dict[str, Any] | None = None
@@ -2221,12 +2258,13 @@ def render_adobe_import(orchestrator: Orchestrator, collection_id: str | None) -
                     title = fields[0].text_input("Título da imagem", key=f"{key}_title")
                     adobe_id = fields[1].text_input("ID Adobe", key=f"{key}_adobe_id")
                     more = st.columns(2)
-                    coll_options = [""] + list(names)
+                    external_id = current_external_id(database)
+                    coll_options = list(names) if external_id in names else [external_id, *names]
                     target_collection = more[0].selectbox(
                         "Coleção", coll_options, key=f"{key}_collection",
-                        index=coll_options.index(collection_id) if collection_id in coll_options else 0,
+                        index=coll_options.index(external_id),
                         format_func=lambda value: names.get(value, "Sem coleção"),
-                    ) or None
+                    )
                     submitted_on = more[1].date_input("Data de envio (opcional)", value=None, key=f"{key}_submitted")
                     reused = database.find_moderation_by_adobe_id(adobe_id)
                     if reused:
@@ -2239,7 +2277,7 @@ def render_adobe_import(orchestrator: Orchestrator, collection_id: str | None) -
                     else:
                         new_image = {
                             "title": title, "adobe_id": adobe_id.strip(), "collection_id": target_collection,
-                            "submitted_at": submitted_on.isoformat() if submitted_on else None,
+                            "submitted_on": submitted_on,
                         }
                 plan.append({
                     "name": file.name, "sales": parsed.sales, "months": parsed.months,
@@ -2275,7 +2313,7 @@ def render_adobe_import(orchestrator: Orchestrator, collection_id: str | None) -
                 record = record_by_id.get(item["record_id"], {})
                 pair_key = (record.get("collection_id"), record.get("detached_from"))
                 found = database.import_conflicts(item["months"], record_id=item["record_id"])
-                label = record.get("collection_name") or "Sem coleção"
+                label = record.get("collection_name") or "Sem vínculo"
                 title = record.get("title", "")
             else:
                 image = item["new_image"]
@@ -2360,7 +2398,7 @@ def render_adobe_import(orchestrator: Orchestrator, collection_id: str | None) -
                     "ID Adobe": item["adobe_id"] or None,
                     "coleção": (
                         f"{item['collection_name']} (removida)" if item["detached_from"] and item["collection_name"]
-                        else item["collection_name"] or "Sem coleção"
+                        else item["collection_name"] or "Sem vínculo"
                     ),
                     "vendas": item["sales"],
                     "receita (USD)": round(item["revenue"], 2),
@@ -2409,15 +2447,16 @@ def render_monthly_sales(
     now = datetime.now(LOCAL_TZ)
     collections = database.list_collections()
     names = {item["id"]: item["name"] for item in collections}
-    options = ([collection_id] if collection_id in names else []) + [""] + [
-        cid for cid in names if cid != collection_id
-    ]
+    external_id = current_external_id(database)
+    options = list(dict.fromkeys(
+        ([collection_id] if collection_id in names else []) + [external_id] + list(names)
+    ))
     with st.form("monthly_sales_entry"):
         columns = st.columns(3)
         year = columns[0].selectbox("Ano", list(range(now.year, now.year - 6, -1)))
         month_number = columns[1].selectbox("Mês", list(range(1, 13)), index=now.month - 1, format_func=lambda v: f"{v:02d}")
         target = columns[2].selectbox(
-            "Coleção", options, format_func=lambda value: "Sem coleção (fora do fluxo)" if not value else names[value],
+            "Coleção", options, format_func=lambda value: names.get(value, "Sem coleção"),
         )
         value_columns = st.columns(3)
         downloads = value_columns[0].number_input("Downloads", min_value=0, step=1)
@@ -2431,7 +2470,7 @@ def render_monthly_sales(
     if save:
         try:
             database.upsert_monthly_sales(
-                target or None, f"{year}-{month_number:02d}", int(downloads), revenue, currency, notes,
+                target, f"{year}-{month_number:02d}", int(downloads), revenue, currency, notes,
                 confirm_import_override=confirm_import,
             )
             st.session_state["monthly_sales_message"] = "Lançamento mensal salvo."
@@ -2446,7 +2485,7 @@ def render_monthly_sales(
                     "origem": "importado" if item["source"] == "import" else "manual",
                     "coleção": (
                         f"{item['collection_name']} (removida)" if item["detached_from"] and item["collection_name"]
-                        else item["collection_name"] or "Sem coleção"
+                        else item["collection_name"] or "Sem vínculo"
                     ),
                     "downloads": item["downloads"],
                     "receita": item["revenue"],
@@ -2461,7 +2500,7 @@ def render_monthly_sales(
             choice = st.selectbox(
                 "Lançamento", [item["id"] for item in sales], key="monthly_delete_choice",
                 format_func=lambda value: next(
-                    f"{item['month']} · {item['collection_name'] or 'Sem coleção'}"
+                    f"{item['month']} · {item['collection_name'] or 'Sem vínculo'}"
                     f"{' (removida)' if item['detached_from'] else ''} · "
                     f"{item['revenue']:.2f} {item['currency']}"
                     for item in sales if item["id"] == value
@@ -2634,8 +2673,10 @@ def render_moderation_editor(
         [
             {
                 name_column: row["title"],
-                detail_column: (row.get("collection_name") or "Sem coleção") if external else row["state"],
+                detail_column: (row.get("collection_name") or "Sem vínculo") if external else row["state"],
                 "resultado": MODERATION_LABELS[row["status"]],
+                "data de envio": local_date(row.get("submitted_at")),
+                "data da decisão": local_date(row.get("decided_at")),
                 "motivo": row["reason"],
                 "ID Adobe": row["adobe_id"],
             }
@@ -2643,6 +2684,9 @@ def render_moderation_editor(
         ],
         index=pd.Index([row["id"] for row in rows], name="id"),
     )
+    # Dtype de data explícito: uma coluna toda vazia viraria texto no editor e quebraria a conversão.
+    for column in ("data de envio", "data da decisão"):
+        table[column] = pd.to_datetime(table[column])
     # A versão na chave descarta as edições pendentes do widget depois de salvar.
     version = st.session_state.get(f"{key}_version", 0)
     edited = st.data_editor(
@@ -2653,17 +2697,34 @@ def render_moderation_editor(
                 "resultado", required=True,
                 options=[label for status, label in MODERATION_LABELS.items() if status or not external],
             ),
+            "data de envio": st.column_config.DateColumn(
+                "data de envio", format="DD/MM/YYYY", max_value=today_local(),
+                help="Data local (Madri). Não pode ser posterior à data da decisão.",
+            ),
+            "data da decisão": st.column_config.DateColumn(
+                "data da decisão", format="DD/MM/YYYY", max_value=today_local(),
+                help="Vazia ao decidir = hoje (mudar o resultado sem mexer na data também grava hoje). Mudar só a data não altera o estado do conceito.",
+            ),
         },
     )
     if not st.button("Salvar moderação", key=f"{key}_save", icon=":material/save:"):
         return
-    by_id = {row["id"]: row for row in rows}
+    by_id = {
+        row["id"]: {
+            **row,
+            "submitted_on": local_date(row.get("submitted_at")),
+            "decided_on": local_date(row.get("decided_at")),
+        }
+        for row in rows
+    }
     changes = moderation_changes(
         by_id,
         {
             row_id: {
                 "status": MODERATION_BY_LABEL[_cell(line["resultado"])],
                 "reason": _cell(line["motivo"]), "adobe_id": _cell(line["ID Adobe"]),
+                "submitted_on": to_date(line["data de envio"]),
+                "decided_on": to_date(line["data da decisão"]),
             }
             for row_id, line in edited.iterrows()
         },
@@ -2680,18 +2741,29 @@ def render_moderation_editor(
             messages.append(("warning", change["warning"]))
         else:
             row = by_id[change["id"]]
+            # Só as datas alteradas são enviadas; as demais ficam como estão no banco.
+            dates = {
+                "submitted_on": change["submitted_on"] if change["submitted_changed"] else None,
+                "decided_on": change["decided_on"] if change["decided_changed"] else None,
+            }
             try:
                 if external:
                     database.update_moderation_record(
                         row["id"], status=change["status"], reason=change["reason"],
-                        adobe_id=change["adobe_id"], notes=row["notes"],
+                        adobe_id=change["adobe_id"], notes=row["notes"], **dates,
                     )
                 else:
                     database.set_moderation(
                         row["concept_id"], change["status"], change["reason"], adobe_id=change["adobe_id"],
+                        **dates,
                     )
                 saved += 1
-            except (ValueError, KeyError) as error:
+                if (
+                    change["status"] in ("approved", "rejected") and change["status"] != row["status"]
+                    and not change["decided_changed"]
+                ):
+                    messages.append(("info", f"{change['title']}: data da decisão definida como hoje."))
+            except (ValueError, KeyError, TypeError) as error:
                 messages.append(("error", f"{change['title']}: {error}"))
     if not saved:
         for level, text in messages:
@@ -2739,9 +2811,10 @@ def render_moderation(orchestrator: Orchestrator, collection_id: str | None) -> 
     with st.expander("Registrar imagem enviada fora do fluxo"):
         with st.form("moderation_external", clear_on_submit=True):
             title = st.text_input("Título da imagem")
-            options = [""] + list(names)
+            external_id = current_external_id(database)
+            options = list(names) if external_id in names else [external_id, *names]
             target = st.selectbox(
-                "Coleção", options, index=options.index(collection_id) if collection_id in options else 0,
+                "Coleção", options, index=options.index(collection_id if collection_id in options else external_id),
                 format_func=lambda value: names.get(value, "Sem coleção"),
             )
             result = st.selectbox(
@@ -2752,7 +2825,7 @@ def render_moderation(orchestrator: Orchestrator, collection_id: str | None) -> 
             adobe_id = st.text_input("ID Adobe")
             submitted_on = st.date_input("Data de envio (opcional)", value=None)
             decided_on = st.date_input(
-                "Data da decisão (aprovada ou rejeitada; padrão hoje)", value=date.today(),
+                "Data da decisão (aprovada ou rejeitada; padrão hoje)", value=today_local(),
                 help="Usada nas aprovadas por semana. Ignorada se o resultado for pendente.",
             )
             notes = st.text_area("Nota")
@@ -2760,24 +2833,21 @@ def render_moderation(orchestrator: Orchestrator, collection_id: str | None) -> 
         if add:
             try:
                 database.add_external_moderation(
-                    title, result, target or None, reason, adobe_id,
-                    submitted_at=submitted_on.isoformat() if submitted_on else None, notes=notes,
-                    decided_at=(
-                        datetime.combine(decided_on, time(12, 0), tzinfo=LOCAL_TZ).astimezone(UTC).isoformat(timespec="seconds")
-                        if decided_on and decided_on != date.today() else None
-                    ),
+                    title, result, target, reason, adobe_id, notes=notes,
+                    submitted_on=submitted_on,
+                    decided_on=decided_on if result != "pending" else None,
                 )
                 st.rerun()
-            except (ValueError, KeyError) as error:
+            except (ValueError, KeyError, TypeError) as error:
                 show_error(error)
     # Sem conceito vinculado (externos e registros órfãos de coleções removidas) só se edita aqui.
     externals = [
         {**record, "status": record["status"]}
-        for scope in dict.fromkeys([collection_id, None] if collection_id else [None])
+        for scope in moderation_scopes(collection_id, current_external_id(database))
         for record in database.list_moderation(scope) if record["concept_id"] is None
     ]
     if externals:
-        st.caption("Imagens sem conceito vinculado (fora do fluxo ou de coleções removidas), da coleção ativa e sem coleção.")
+        st.caption("Imagens sem conceito vinculado (fora do fluxo), da coleção ativa, e registros órfãos de coleções removidas.")
         render_moderation_editor(orchestrator, "moderation_external_table", externals, external=True)
 
 
@@ -2818,6 +2888,7 @@ def main() -> None:
         orchestrator = get_orchestrator(config_json, code_version())
     database = orchestrator.database
     recover_stale_runs()
+    st.session_state["external_collection_run_id"] = database.external_collection_id()
     collections = database.list_collections()
 
     with st.sidebar:
@@ -2874,7 +2945,9 @@ def main() -> None:
         render_evaluation(orchestrator, config, collection_id)
     with tabs[2]:
         st.title("Ampliação")
-        if collection_id:
+        if external_collection_notice(database, collection_id):
+            pass
+        elif collection_id:
             collection = database.get_collection(collection_id)
             st.divider()
             st.subheader(collection["name"] if collection else "Coleção")
@@ -2893,13 +2966,16 @@ def main() -> None:
             st.info("Selecione uma coleção no painel lateral ou abra uma pelo Painel para iniciar a produção.")
     with tabs[3]:
         st.title("Metadados")
-        if collection_id:
+        if external_collection_notice(database, collection_id):
+            pass
+        elif collection_id:
             render_metadata_tab(orchestrator, config, collection_id)
         else:
             st.info("Selecione uma coleção no painel lateral para gerar os metadados.")
     with tabs[4]:
         st.title("Exportação e envio humano")
-        render_export(orchestrator, collection_id)
+        if not external_collection_notice(database, collection_id):
+            render_export(orchestrator, collection_id)
     with tabs[5]:
         st.title("Registro da moderação")
         render_moderation(orchestrator, collection_id)

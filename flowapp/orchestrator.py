@@ -57,6 +57,14 @@ class Orchestrator:
         self.comfy.close()
         self.lmstudio.close()
 
+    def ensure_normal(self, collection_id: str) -> None:
+        """Recusa operações com agentes/ComfyUI na coleção das imagens enviadas fora do fluxo."""
+        collection = self.database.get_collection(collection_id)
+        if collection is not None and collection.get("kind") == "external":
+            raise ValueError(
+                "Esta é a coleção das imagens enviadas fora do fluxo: os agentes e o ComfyUI não rodam nela."
+            )
+
     def delete_collection(self, collection_id: str) -> None:
         try:
             normalized_id = str(uuid.UUID(collection_id))
@@ -64,8 +72,11 @@ class Orchestrator:
             raise ValueError("Identificador de coleção inválido.") from error
         if normalized_id != collection_id:
             raise ValueError("Identificador de coleção inválido.")
-        if self.database.get_collection(collection_id) is None:
+        collection = self.database.get_collection(collection_id)
+        if collection is None:
             raise KeyError("Coleção não encontrada.")
+        if collection.get("kind") == "external":
+            raise ValueError("A coleção das imagens enviadas fora do fluxo não pode ser removida.")
         if self.runs.list_runs(PROJECT, collection_id, limit=1, active_only=True):
             raise ValueError("Não é possível remover uma coleção com agentes em execução.")
 
@@ -162,6 +173,7 @@ class Orchestrator:
         height: int,
         progress: Progress | None = None,
     ) -> list[dict]:
+        self.ensure_normal(collection_id)
         if not 1 <= amount <= 8:
             raise ValueError("Gere entre 1 e 8 candidatos por lote.")
         if not 256 <= width <= 8192 or not 256 <= height <= 8192:
@@ -234,6 +246,7 @@ class Orchestrator:
         self, collection_id: str, progress: Progress | None = None,
         concept_id: str | None = None,
     ) -> list[dict]:
+        self.ensure_normal(collection_id)
         results = []
         for job in self.database.list_recoverable_jobs(collection_id):
             if concept_id and job["concept_id"] != concept_id:
@@ -307,6 +320,7 @@ class Orchestrator:
         *,
         model_id: str = "",
     ) -> dict:
+        self.ensure_normal(collection_id)
         if concept["state"] != WorkflowState.CANDIDATES_READY.value:
             raise ValueError("A correção só está disponível antes da seleção humana.")
         if source_asset["role"] not in {"candidate", "correction"} or source_asset["status"] != "candidate":
@@ -453,6 +467,7 @@ class Orchestrator:
     def upscale_selected(
         self, collection_id: str, concept: dict, asset: dict, progress: Progress | None = None,
     ) -> dict:
+        self.ensure_normal(collection_id)
         if concept["state"] != WorkflowState.SELECTED.value:
             raise ValueError("Selecione um candidato antes do upscale.")
         profile = load_profile(self.images.collection_path(collection_id), "upscale")
