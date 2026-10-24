@@ -334,6 +334,11 @@ class Database:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY (moderation_record_id, sha256)
                 );
+                CREATE TABLE IF NOT EXISTS agency_exports (
+                    id TEXT PRIMARY KEY, asset_id TEXT NOT NULL, collection_id TEXT,
+                    collection_name TEXT NOT NULL, profile_id TEXT NOT NULL,
+                    report_json TEXT NOT NULL, created_at TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS ix_concepts_collection ON concepts(collection_id, created_at);
                 CREATE INDEX IF NOT EXISTS ix_assets_concept ON assets(concept_id, created_at);
                 CREATE INDEX IF NOT EXISTS ix_jobs_status ON jobs(status, created_at);
@@ -1239,6 +1244,24 @@ class Database:
                 "UPDATE assets SET export_json = ? WHERE id = ?",
                 (json.dumps(export, ensure_ascii=False), asset_id),
             )
+
+    def record_agency_export(self, asset: dict, profile_id: str, report: dict) -> str:
+        record_id = str(uuid.uuid4())
+        collection = self.get_collection(asset["collection_id"])
+        with self.connect() as connection:
+            connection.execute(
+                "INSERT INTO agency_exports(id, asset_id, collection_id, collection_name, profile_id, report_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (record_id, asset["id"], asset["collection_id"], (collection or {}).get("name", ""), profile_id,
+                 json.dumps(report, ensure_ascii=False), utc_now()),
+            )
+        return record_id
+
+    def list_agency_exports(self, collection_id: str, profile_id: str) -> list[dict]:
+        with self.connect() as connection:
+            rows = connection.execute("SELECT * FROM agency_exports WHERE collection_id = ? AND profile_id = ? "
+                                      "ORDER BY created_at DESC, rowid DESC", (collection_id, profile_id)).fetchall()
+        return [{**dict(row), "report": json.loads(row["report_json"])} for row in rows]
 
     def update_asset_status(self, asset_id: str, status: str, role: str | None = None) -> None:
         with self.connect() as connection:
