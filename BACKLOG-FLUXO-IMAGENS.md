@@ -46,10 +46,12 @@ O app conta 4 aprovadas e 5 rejeitadas, mas o portfólio já tem 11 imagens dos 
 Validação local em 24/10/2026: 3/3 rejeitadas por qualidade com alerta e 11/11 aprovadas locais sem alerta. Calibração na própria amostra; limitações e reprodução no README.
 
 ### 5. Detecção de imagens parecidas
-- [ ] Comparar candidatas entre si e com tudo o que já foi enviado (hash perceptual e, se couber na VRAM, embeddings como CLIP).
-- [ ] Na exportação, avisar quando duas imagens do pacote forem parecidas, ou quando uma for parecida com algo já enviado.
-- [ ] Regra padrão: uma imagem por conceito, configurável.
+- [x] Comparar candidatas entre si e com tudo o que já foi enviado (hash perceptual e, se couber na VRAM, embeddings como CLIP).
+- [x] Na exportação, avisar quando duas imagens do pacote forem parecidas, ou quando uma for parecida com algo já enviado.
+- [x] Regra padrão: uma imagem por conceito, configurável.
 - Aceite: "The Filament Dandelion" e "The Transistor Mycelium" aparecem como parecidas com as imagens aprovadas do Jardim Eletrônico.
+
+Validação local em 24/10/2026: os dois pares do aceite recebem alerta de paleta semelhante a The Capacitor Vine Canopy (91,4% e 83,6%). Hash perceptual e paleta em CPU; cobertura incompleta é informada, com anexação de referências locais para os envios externos. Limitações e reprodução no README.
 
 ## P1. Temas e produção
 

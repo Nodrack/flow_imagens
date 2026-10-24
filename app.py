@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import sqlite3
@@ -39,6 +40,7 @@ from flowapp.database import (
     MAX_WORK_MINUTES, REJECTION_PREFIX, TimerTooLong,
 )
 from flowapp.images import ImageStore, ImageValidationError
+from flowapp.similarity import matches_for_asset
 from flowapp.metrics import (
     approval_rate, approved_per_week, collection_key, downloads_per_approved, format_hours,
     format_per_hour, revenue_per_hour,
@@ -295,6 +297,21 @@ def render_settings(config: AppConfig) -> AppConfig:
             "max_local_detail_ratio": "Razão regional máxima entre Laplaciano e gradiente",
         }.items():
             quality_values[field] = st.number_input(label, value=getattr(config.quality_rules, field))
+        st.markdown("**Imagens parecidas (CPU)**")
+        similarity_values = {
+            "max_phash_distance": st.number_input("Distância máxima do hash perceptual (63 bits)",
+                min_value=0, max_value=63, value=config.similarity_rules.max_phash_distance),
+            "compare_palette": st.checkbox("Avisar também sobre paleta semelhante", value=config.similarity_rules.compare_palette),
+            "min_palette_overlap": st.number_input("Sobreposição mínima da paleta (0 a 1)",
+                min_value=0.0, max_value=1.0, value=config.similarity_rules.min_palette_overlap, step=0.01),
+            "one_per_concept": st.checkbox("Uma imagem por conceito na exportação e no histórico",
+                value=config.similarity_rules.one_per_concept),
+            "thumbnail_size": st.number_input("Lado da miniatura para comparar paletas (pixels)",
+                min_value=16, max_value=256, value=config.similarity_rules.thumbnail_size),
+            "palette_bins": st.number_input("Faixas por canal da paleta RGB",
+                min_value=2, max_value=16, value=config.similarity_rules.palette_bins),
+        }
+        st.caption("Paleta semelhante é um alerta amplo: confirme assunto e composição. Nenhum modelo usa VRAM nesta análise.")
         saved = st.form_submit_button("Salvar configuração", type="primary")
     if saved:
         new_config = AppConfig(
@@ -314,6 +331,7 @@ def render_settings(config: AppConfig) -> AppConfig:
             upscale_factor=float(upscale_factor),
             timer_max_hours=float(timer_max_hours),
             quality_rules=quality_values,
+            similarity_rules=similarity_values,
             export_rules={
                 "min_megapixels": min_mp or None,
                 "max_megapixels": max_mp or None,
@@ -1010,6 +1028,8 @@ def render_evaluation(orchestrator: Orchestrator, config: AppConfig, collection_
         return
 
     all_assets = {concept["id"]: database.list_assets(concept["id"]) for concept in concepts}
+    with st.expander("Imagens parecidas entre candidatas e com envios anteriores"):
+        render_similarity_report(orchestrator.similarity_checker().report(collection_id, "candidates"))
     images = [
         asset for assets in all_assets.values() for asset in assets
         if asset["role"] in {"candidate", "correction"}
@@ -1699,6 +1719,49 @@ EXPORT_DONE_STATES = {
 }
 
 
+def render_similarity_report(report: dict) -> None:
+    st.caption(f"{report['compared_images']} imagem(ns) comparadas com {report['history_images']} referência(s) de envios anteriores. Hash mede proximidade visual; paleta mede cores, não significado.")
+    if report["matches"]:
+        st.warning(f"{len(report['matches'])} par(es) para revisar antes de exportar.")
+        st.dataframe([{
+            "Imagem": match["left"]["title"], "Comparada com": match["right"]["title"],
+            "Arquivo": Path(match["left"]["path"]).name,
+            "Arquivo comparado": Path(match["right"]["path"]).name,
+            "Origem": "Envio anterior" if match["right"]["source"] == "history" else "Nesta coleção",
+            "Moderação": match["right"].get("moderation", ""),
+            "Distância hash / 63": match["phash_distance"],
+            "Sobreposição da paleta": round(match["palette_overlap"], 4),
+            "Motivo": " ".join(match["reasons"]),
+        } for match in report["matches"]], hide_index=True)
+    else:
+        st.caption("Nenhum par ultrapassou os limiares configurados nas imagens analisadas.")
+    if report["missing_history"]:
+        st.warning(f"Comparação incompleta: {len(report['missing_history'])} envio(s) sem imagem local. Anexe as referências na aba Exportação.")
+    if report["unreadable"]:
+        st.warning("Arquivos ausentes ou ilegíveis: " + ", ".join(row["title"] for row in report["unreadable"]))
+
+
+def export_preflight(orchestrator: Orchestrator, asset: dict, similarity: dict) -> dict:
+    metadata = asset.get("metadata") or {}
+    _, result = orchestrator.images.export_jpeg(
+        asset, metadata.get("title_en", ""), metadata.get("keywords", []),
+        orchestrator.config.export_rules, quality_rules=orchestrator.config.quality_rules, preview=True,
+    )
+    related = matches_for_asset(similarity, asset["id"])
+    for match in related:
+        other = match["right"] if match["left"]["id"] == asset["id"] else match["left"]
+        result["warnings"].append(f"Semelhança com {other['title']}: " + " ".join(match["reasons"]))
+    if similarity["missing_history"] or similarity["unreadable"]:
+        result["warnings"].append("Comparação de similaridade incompleta: faltam referências legíveis. Confira a cobertura do histórico.")
+    unreadable_subject = any(row["id"] == asset["id"] for row in similarity["unreadable"])
+    result["blocked"] = (result["technical"]["status"] == "blocked"
+                         or any(match["blocked"] for match in related) or unreadable_subject)
+    # A change to rules, files, pairs or coverage invalidates the old confirmation widget.
+    payload = json.dumps([asset["id"], result, similarity, orchestrator.config.model_dump(mode="json")], sort_keys=True)
+    result["confirmation_key"] = hashlib.sha256(payload.encode()).hexdigest()[:16]
+    return result
+
+
 def render_export(orchestrator: Orchestrator, collection_id: str | None) -> None:
     st.subheader("Preparação e envio manual")
     if not collection_id:
@@ -1706,6 +1769,23 @@ def render_export(orchestrator: Orchestrator, collection_id: str | None) -> None
         return
     database = orchestrator.database
     concepts = database.list_concepts(collection_id)
+    similarity = orchestrator.similarity_checker().report(collection_id)
+    with st.expander("Similaridade do pacote e do histórico", expanded=bool(similarity["matches"])):
+        render_similarity_report(similarity)
+        missing = {row["id"]: row["title"] for row in similarity["missing_history"]}
+        missing.update({row["record_id"]: row["title"] for row in similarity["unreadable"] if row.get("record_id")})
+        if missing:
+            with st.form(f"similarity_reference_{collection_id}", clear_on_submit=True):
+                record_id = st.selectbox("Envio sem referência legível", list(missing),
+                    format_func=lambda value: f"{missing[value]} ({value[:8]})")
+                reference = st.file_uploader("Anexar a imagem enviada para comparação", type=["jpg", "jpeg", "png"])
+                attach = st.form_submit_button("Salvar referência local")
+            if attach and reference is not None:
+                try:
+                    orchestrator.similarity_checker().attach_reference(record_id, reference.getvalue())
+                    st.rerun()
+                except Exception as error:
+                    show_error(error)
     with st.expander("Calibração com imagens moderadas"):
         st.caption("Compare aprovadas e rejeitadas antes de ajustar os limiares na Configuração. As métricas não garantem aprovação; ruído também responde a textura. Imagens externas sem arquivo local não são analisadas.")
         if st.button("Analisar referências locais", key="quality_references"):
@@ -1726,12 +1806,12 @@ def render_export(orchestrator: Orchestrator, collection_id: str | None) -> None
     st.caption("Nenhum endpoint de upload Adobe será chamado. Transferência, submissão e decisão Adobe têm confirmações separadas.")
     if not rules.technical_rules_verified:
         st.warning("Limites técnicos ainda não foram verificados na fonte oficial; exportação mostra avisos e não presume aprovação.")
-    render_prepare_all(orchestrator, concepts)
+    render_prepare_all(orchestrator, concepts, similarity)
     render_adobe_csv(orchestrator, collection_id, concepts)
     render_transfer_all(orchestrator, collection_id, concepts)
     for concept in concepts:
         st.divider()
-        render_concept_export(orchestrator, collection_id, concept)
+        render_concept_export(orchestrator, collection_id, concept, similarity)
 
 
 def render_transfer_all(orchestrator: Orchestrator, collection_id: str, concepts: list[dict]) -> None:
@@ -1801,16 +1881,34 @@ def batch_transition(orchestrator: Orchestrator, concepts: list[dict], target: W
         st.rerun()
 
 
-def render_prepare_all(orchestrator: Orchestrator, concepts: list[dict]) -> None:
+def render_prepare_all(orchestrator: Orchestrator, concepts: list[dict], similarity: dict | None = None) -> None:
     ready = [
         concept for concept in concepts
         if concept["state"] == WorkflowState.METADATA_READY.value and final_upscale(orchestrator.database, concept["id"])
     ]
     if not ready:
         return
+    similarity = similarity if similarity is not None else orchestrator.similarity_checker().report(ready[0]["collection_id"])
+    checks, failures = [], []
+    for concept in ready:
+        try:
+            check = export_preflight(orchestrator, final_upscale(orchestrator.database, concept["id"]), similarity)
+            checks.append(check)
+            for reason in check["warnings"]:
+                st.warning(f"{concept['data']['concept']}: {reason}")
+        except Exception as error:
+            failures.append(str(error))
+    for failure in failures:
+        st.error(failure)
+    blocked = bool(failures) or any(check["blocked"] for check in checks)
+    warnings = any(check["warnings"] for check in checks)
+    token = "_".join(check["confirmation_key"] for check in checks)
+    confirmed = st.checkbox("Revisei os alertas técnicos e de similaridade de todo o lote",
+        key=f"batch_export_confirm_{token}") if warnings else True
     if st.button(
         f"Preparar todos os pacotes ({len(ready)})", type="primary", icon=":material/inventory_2:",
         key=f"prepare_all_{concepts[0]['collection_id']}",
+        disabled=blocked or not confirmed,
     ):
         failures = []
         progress = st.progress(0.0, text="Preparando pacotes…")
@@ -1866,7 +1964,7 @@ def render_adobe_csv(orchestrator: Orchestrator, collection_id: str, concepts: l
         st.warning(warning)
 
 
-def render_concept_export(orchestrator: Orchestrator, collection_id: str, concept: dict) -> None:
+def render_concept_export(orchestrator: Orchestrator, collection_id: str, concept: dict, similarity: dict | None = None) -> None:
     database = orchestrator.database
     state = WorkflowState(concept["state"])
     asset = final_upscale(database, concept["id"])
@@ -1881,17 +1979,19 @@ def render_concept_export(orchestrator: Orchestrator, collection_id: str, concep
             metadata = asset.get("metadata") or {}
             st.markdown(f"**{metadata.get('title_en', '')}**")
             st.caption(f"{len(metadata.get('keywords', []))} palavras-chave")
-            _, preview = orchestrator.images.export_jpeg(
-                asset, metadata.get("title_en", ""), metadata.get("keywords", []),
-                orchestrator.config.export_rules, quality_rules=orchestrator.config.quality_rules, preview=True,
-            )
+            similarity = similarity if similarity is not None else orchestrator.similarity_checker().report(collection_id)
+            try:
+                preview = export_preflight(orchestrator, asset, similarity)
+            except Exception as error:
+                show_error(error)
+                return
             technical = preview["technical"]
             st.write("Checagem técnica: " + {"approved": "aprovada", "warning": "alerta", "blocked": "bloqueada"}[technical["status"]])
             st.json(technical["metrics"], expanded=False)
             for reason in preview["warnings"]:
                 st.warning(reason)
-            confirmed = st.checkbox("Revisei os alertas e quero incluir esta imagem", key=f"quality_confirm_{concept['id']}") if preview["warnings"] else True
-            if st.button("Preparar JPEG", type="primary", key=f"prepare_package_{concept['id']}", disabled=technical["status"] == "blocked" or not confirmed):
+            confirmed = st.checkbox("Revisei os alertas e quero incluir esta imagem", key=f"quality_confirm_{concept['id']}_{preview['confirmation_key']}") if preview["warnings"] else True
+            if st.button("Preparar JPEG", type="primary", key=f"prepare_package_{concept['id']}", disabled=preview["blocked"] or not confirmed):
                 try:
                     output, _ = orchestrator.prepare_package(concept, allow_warnings=confirmed)
                     st.success(f"Pacote preparado: {output}")

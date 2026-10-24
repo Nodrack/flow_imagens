@@ -46,5 +46,13 @@
     "region_min_contrast": 10,
     "min_local_sharpness_p25": 12,
     "max_local_detail_ratio": 1
+  },
+  "similarity_rules": {
+    "max_phash_distance": 10,
+    "compare_palette": true,
+    "min_palette_overlap": 0.8,
+    "one_per_concept": true,
+    "thumbnail_size": 64,
+    "palette_bins": 8
   }
 }
