@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from enum import StrEnum
 from typing import Literal
+from zoneinfo import ZoneInfo
 
 from agentkit.comfy import WorkflowInputRef, WorkflowProfile  # noqa: F401 - WorkflowInputRef reexportado
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -244,3 +245,24 @@ class PerformanceEntry(BaseModel):
     user_cost: float = Field(default=0, ge=0)
     cost_currency: str = Field(default="USD", pattern="^[A-Z]{3}$")
     notes: str = Field(default="", max_length=1000)
+
+
+# Fuso usado para semanas e meses dos indicadores (os timestamps do banco ficam em UTC).
+LOCAL_TZ = ZoneInfo("Europe/Madrid")
+
+
+class MonthlySalesEntry(BaseModel):
+    """Downloads e receita de um mês, conferidos manualmente no painel da Adobe."""
+
+    month: str = Field(pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
+    downloads: int = Field(default=0, ge=0)
+    revenue: float = Field(default=0, ge=0)
+    currency: str = Field(default="USD", pattern="^[A-Z]{3}$")
+    notes: str = Field(default="", max_length=1000)
+
+    @field_validator("month")
+    @classmethod
+    def month_not_in_future(cls, value: str) -> str:
+        if value > datetime.now(LOCAL_TZ).strftime("%Y-%m"):
+            raise ValueError("O mês do lançamento não pode estar no futuro.")
+        return value

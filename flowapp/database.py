@@ -9,8 +9,8 @@ from types import EllipsisType
 from typing import Any, get_args
 
 from flowapp.schemas import (
-    CollectionBrief, ConceptPlan, ModerationStatus, PerformanceEntry, STATE_TRANSITIONS,
-    WorkflowState,
+    CollectionBrief, ConceptPlan, ModerationStatus, MonthlySalesEntry, PerformanceEntry,
+    STATE_TRANSITIONS, WorkflowState,
 )
 
 
@@ -208,6 +208,19 @@ class Database:
                 CREATE INDEX IF NOT EXISTS ix_work_sessions_collection ON work_sessions(collection_id, work_date);
                 CREATE UNIQUE INDEX IF NOT EXISTS ux_work_sessions_open_timer
                     ON work_sessions((1)) WHERE source = 'timer' AND ended_at IS NULL;
+                CREATE TABLE IF NOT EXISTS monthly_sales (
+                    id TEXT PRIMARY KEY,
+                    collection_id TEXT REFERENCES collections(id),
+                    collection_name TEXT NOT NULL DEFAULT '',
+                    month TEXT NOT NULL, downloads INTEGER NOT NULL CHECK (downloads >= 0),
+                    revenue REAL NOT NULL CHECK (revenue >= 0), currency TEXT NOT NULL,
+                    notes TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS archived_work_minutes (
+                    detached_from TEXT PRIMARY KEY, collection_name TEXT NOT NULL,
+                    minutes REAL NOT NULL, manual_minutes REAL NOT NULL,
+                    revenue_json TEXT NOT NULL DEFAULT '{}', archived_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS moderation_records (
                     id TEXT PRIMARY KEY,
                     collection_id TEXT REFERENCES collections(id),
@@ -248,6 +261,21 @@ class Database:
                     connection.execute(
                         f"ALTER TABLE moderation_records ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
                     )
+            for table, extra in (
+                ("monthly_sales", (("detached_from", "TEXT"),)),
+                ("moderation_records", (("detached_from", "TEXT"), ("detached_name", "TEXT NOT NULL DEFAULT ''"))),
+            ):
+                existing_columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+                for column, definition in extra:
+                    # Origem (id e nome) de registros que sobrevivem à remoção da coleção.
+                    if column not in existing_columns:
+                        connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+            # Um lançamento por coleção (ou por coleção removida, via detached_from) e mês.
+            connection.execute("DROP INDEX IF EXISTS ux_monthly_sales_key")
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_monthly_sales_month ON monthly_sales("
+                "COALESCE(collection_id, detached_from, ''), month)"
+            )
             self._backfill_moderation(connection)
 
     @staticmethod
@@ -327,7 +355,7 @@ class Database:
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             collection = connection.execute(
-                "SELECT id FROM collections WHERE id = ?", (collection_id,)
+                "SELECT id, name FROM collections WHERE id = ?", (collection_id,)
             ).fetchone()
             if collection is None:
                 raise KeyError("Coleção não encontrada.")
@@ -361,10 +389,16 @@ class Database:
                             (collection_id,),
                         )
                 connection.execute("DELETE FROM pipeline_runs WHERE collection_id = ?", (collection_id,))
+            self._archive_work(connection, collection_id, collection["name"])
             connection.execute(
                 "DELETE FROM performance_records WHERE collection_id = ?", (collection_id,)
             )
             connection.execute("DELETE FROM work_sessions WHERE collection_id = ?", (collection_id,))
+            # Lançamentos mensais são histórico financeiro: ficam sem vínculo, com origem e nome.
+            connection.execute(
+                "UPDATE monthly_sales SET detached_from = collection_id, collection_name = ?, "
+                "collection_id = NULL WHERE collection_id = ?", (collection["name"], collection_id),
+            )
             connection.execute("DELETE FROM agent_runs WHERE collection_id = ?", (collection_id,))
             connection.execute("DELETE FROM jobs WHERE collection_id = ?", (collection_id,))
             connection.execute(
@@ -374,8 +408,9 @@ class Database:
             )
             # O histórico de moderação é preservado (sem vínculo) para continuar alimentando os agentes.
             connection.execute(
-                "UPDATE moderation_records SET concept_id = NULL, collection_id = NULL "
-                "WHERE collection_id = ?", (collection_id,),
+                "UPDATE moderation_records SET concept_id = NULL, detached_from = collection_id, "
+                "detached_name = ?, collection_id = NULL WHERE collection_id = ?",
+                (collection["name"], collection_id),
             )
             connection.execute("DELETE FROM assets WHERE collection_id = ?", (collection_id,))
             connection.execute("DELETE FROM concepts WHERE collection_id = ?", (collection_id,))
@@ -595,7 +630,7 @@ class Database:
     def list_moderation(self, collection_id: str | None | EllipsisType = ...) -> list[dict[str, Any]]:
         """Registros de uma coleção (None = sem coleção); sem argumento, todos."""
         query = (
-            "SELECT m.*, col.name AS collection_name FROM moderation_records m "
+            "SELECT m.*, COALESCE(col.name, m.detached_name) AS collection_name FROM moderation_records m "
             "LEFT JOIN collections col ON col.id = m.collection_id"
         )
         params: tuple[Any, ...] = ()
@@ -1034,6 +1069,105 @@ class Database:
                 (collection_id, limit),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    @staticmethod
+    def _archive_work(connection: sqlite3.Connection, collection_id: str, name: str) -> None:
+        """Guarda horas e receita avulsa da coleção antes de apagá-las, para a receita/hora total
+        não inflar ao remover (os lançamentos mensais continuam, vinculados por detached_from)."""
+        minutes = connection.execute(
+            "SELECT COALESCE(SUM(minutes), 0) AS total FROM work_sessions "
+            "WHERE collection_id = ? AND minutes IS NOT NULL", (collection_id,),
+        ).fetchone()["total"]
+        manual = connection.execute(
+            "SELECT COALESCE(SUM(manual_minutes), 0) AS total FROM performance_records "
+            "WHERE collection_id = ?", (collection_id,),
+        ).fetchone()["total"]
+        revenue = {
+            row["revenue_currency"]: row["total"] for row in connection.execute(
+                "SELECT revenue_currency, SUM(revenue) AS total FROM performance_records "
+                "WHERE collection_id = ? GROUP BY revenue_currency", (collection_id,),
+            )
+        }
+        if minutes or manual or revenue:
+            connection.execute(
+                "INSERT INTO archived_work_minutes(detached_from, collection_name, minutes, "
+                "manual_minutes, revenue_json, archived_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (collection_id, name, minutes, manual, json.dumps(revenue), utc_now()),
+            )
+
+    def list_archived_work(self) -> list[dict[str, Any]]:
+        """Horas e receita avulsa de coleções removidas (uma linha por coleção)."""
+        with self.connect() as connection:
+            rows = connection.execute("SELECT * FROM archived_work_minutes").fetchall()
+        return [
+            {**dict(row), "revenue": json.loads(row["revenue_json"] or "{}")} for row in rows
+        ]
+
+    # --- Downloads e receita mensais -----------------------------------------------------
+
+    def upsert_monthly_sales(
+        self, collection_id: str | None, month: str, downloads: int, revenue: float,
+        currency: str, notes: str = "",
+    ) -> str:
+        """Lança o mês; repetir o mês da mesma coleção substitui o valor, inclusive a moeda (correção)."""
+        entry = MonthlySalesEntry(
+            month=month, downloads=downloads, revenue=revenue, currency=currency, notes=notes.strip(),
+        )
+        timestamp = utc_now()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if collection_id is not None and connection.execute(
+                "SELECT 1 FROM collections WHERE id = ?", (collection_id,)
+            ).fetchone() is None:
+                raise KeyError("Coleção não encontrada.")
+            if collection_id is None:
+                existing = connection.execute(
+                    "SELECT id FROM monthly_sales WHERE collection_id IS NULL AND detached_from IS NULL "
+                    "AND month = ?", (entry.month,),
+                ).fetchone()
+            else:
+                existing = connection.execute(
+                    "SELECT id FROM monthly_sales WHERE collection_id = ? AND month = ?",
+                    (collection_id, entry.month),
+                ).fetchone()
+            if existing:
+                connection.execute(
+                    "UPDATE monthly_sales SET downloads = ?, revenue = ?, currency = ?, notes = ?, "
+                    "updated_at = ? WHERE id = ?",
+                    (entry.downloads, entry.revenue, entry.currency, entry.notes, timestamp, existing["id"]),
+                )
+                return existing["id"]
+            sale_id = str(uuid.uuid4())
+            connection.execute(
+                "INSERT INTO monthly_sales(id, collection_id, collection_name, month, downloads, "
+                "revenue, currency, notes, created_at, updated_at) VALUES (?, ?, '', ?, ?, ?, ?, ?, ?, ?)",
+                (sale_id, collection_id, entry.month, entry.downloads, entry.revenue, entry.currency,
+                 entry.notes, timestamp, timestamp),
+            )
+        return sale_id
+
+    def list_monthly_sales(self, collection_id: str | None | EllipsisType = ...) -> list[dict[str, Any]]:
+        """Lançamentos de uma coleção (None = sem coleção/removidas); sem argumento, todos."""
+        query = (
+            "SELECT s.id, s.collection_id, COALESCE(c.name, s.collection_name) AS collection_name, "
+            "s.detached_from, s.month, s.downloads, s.revenue, s.currency, s.notes FROM monthly_sales s "
+            "LEFT JOIN collections c ON c.id = s.collection_id"
+        )
+        params: tuple[Any, ...] = ()
+        if collection_id is None:
+            query += " WHERE s.collection_id IS NULL"
+        elif collection_id is not ...:
+            query += " WHERE s.collection_id = ?"
+            params = (collection_id,)
+        with self.connect() as connection:
+            rows = connection.execute(query + " ORDER BY s.month DESC, collection_name", params).fetchall()
+        return [dict(row) for row in rows]
+
+    def delete_monthly_sales(self, sale_id: str) -> None:
+        """Exclusão explícita (UI com confirmação)."""
+        with self.connect() as connection:
+            if connection.execute("DELETE FROM monthly_sales WHERE id = ?", (sale_id,)).rowcount == 0:
+                raise KeyError("Lançamento mensal não encontrado.")
 
     # --- Registro de horas por coleção -------------------------------------------------
 
