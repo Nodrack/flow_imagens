@@ -885,6 +885,22 @@ def render_asset_card(
         render_correction(orchestrator, collection_id, concept, asset, models)
 
 
+def render_collapsed_concept(
+    index: int, plan: ConceptPlan, concept: dict, assets: list[dict], expanded_key: str,
+) -> None:
+    """Linha compacta para conceitos que já têm imagem escolhida; expande sob demanda."""
+    chosen = next((asset for asset in assets if asset["id"] == concept["selected_asset_id"]), None)
+    with st.container(border=True):
+        thumb, text, action = st.columns([1, 5, 1], vertical_alignment="center")
+        if chosen and Path(chosen["path"]).is_file():
+            thumb.image(chosen["path"], width="stretch")
+        text.markdown(f"**{index}. {plan.concept}**")
+        text.caption(f"Imagem escolhida · {plan.commercial_application}")
+        if action.button("Expandir", icon=":material/unfold_more:", key=f"expand_{concept['id']}"):
+            st.session_state[expanded_key] = True
+            st.rerun()
+
+
 def render_evaluation(orchestrator: Orchestrator, config: AppConfig, collection_id: str | None) -> None:
     if not collection_id:
         st.info("Crie uma coleção no Painel ou selecione uma no menu lateral.")
@@ -980,6 +996,10 @@ def render_evaluation(orchestrator: Orchestrator, config: AppConfig, collection_
     for index, concept in enumerate(concepts, start=1):
         plan = ConceptPlan.model_validate(concept["data"])
         state = WorkflowState(concept["state"])
+        expanded_key = f"eval_expanded_{concept['id']}"
+        if concept.get("selected_asset_id") and not st.session_state.get(expanded_key):
+            render_collapsed_concept(index, plan, concept, all_assets[concept["id"]], expanded_key)
+            continue
         with st.container(border=True):
             st.markdown(f"**{index}. {plan.concept}**")
             st.caption(f"{plan.commercial_application} · {ORIENTATION_LABELS.get(plan.orientation, plan.orientation)}")
@@ -1014,6 +1034,9 @@ def render_evaluation(orchestrator: Orchestrator, config: AppConfig, collection_
             if concept.get("selected_asset_id"):
                 st.success("Imagem escolhida. Continue com o upscale na aba Ampliação e os metadados na aba Metadados.")
                 render_unselect_button(orchestrator, concept, "eval")
+                if st.button("Recolher", icon=":material/unfold_less:", key=f"collapse_{concept['id']}"):
+                    st.session_state[expanded_key] = False
+                    st.rerun()
             elif state in {WorkflowState.CANDIDATES_READY, WorkflowState.FAILED}:
                 actions = st.columns(2)
                 if actions[0].button(
