@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from types import EllipsisType
 from typing import Any, get_args
@@ -14,8 +14,23 @@ from flowapp.schemas import (
 )
 
 
+MAX_WORK_MINUTES = 24 * 60
+
+
 class InvalidTransition(ValueError):
     pass
+
+
+class TimerTooLong(ValueError):
+    """Cronômetro acima do limite: provavelmente esquecido; pede os minutos reais."""
+
+    def __init__(self, minutes: float, max_minutes: float) -> None:
+        self.minutes = minutes
+        self.max_minutes = max_minutes
+        super().__init__(
+            f"O cronômetro mediu {minutes / 60:.1f} h, acima do limite de {max_minutes / 60:.1f} h. "
+            "Informe os minutos realmente trabalhados para registrar."
+        )
 
 
 class DuplicateJobError(ValueError):
@@ -184,6 +199,15 @@ class Database:
                     manual_minutes REAL NOT NULL, user_cost REAL NOT NULL,
                     cost_currency TEXT NOT NULL, notes TEXT NOT NULL, created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS work_sessions (
+                    id TEXT PRIMARY KEY, collection_id TEXT NOT NULL REFERENCES collections(id),
+                    work_date TEXT NOT NULL, started_at TEXT, ended_at TEXT, minutes REAL,
+                    source TEXT NOT NULL CHECK (source IN ('manual', 'timer')),
+                    notes TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS ix_work_sessions_collection ON work_sessions(collection_id, work_date);
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_work_sessions_open_timer
+                    ON work_sessions((1)) WHERE source = 'timer' AND ended_at IS NULL;
                 CREATE TABLE IF NOT EXISTS moderation_records (
                     id TEXT PRIMARY KEY,
                     collection_id TEXT REFERENCES collections(id),
@@ -314,6 +338,14 @@ class Database:
             ).fetchone()
             if active_job:
                 raise ValueError("Não é possível remover uma coleção com trabalhos ComfyUI ativos.")
+            if connection.execute(
+                "SELECT 1 FROM work_sessions WHERE collection_id = ? "
+                "AND source = 'timer' AND ended_at IS NULL LIMIT 1", (collection_id,),
+            ).fetchone():
+                raise ValueError(
+                    "Não é possível remover uma coleção com cronômetro aberto. "
+                    "Pare ou descarte o cronômetro antes."
+                )
             # Tabelas de agentes de versões anteriores (hoje no banco central do agentkit).
             existing = {
                 row["name"] for row in connection.execute(
@@ -332,6 +364,7 @@ class Database:
             connection.execute(
                 "DELETE FROM performance_records WHERE collection_id = ?", (collection_id,)
             )
+            connection.execute("DELETE FROM work_sessions WHERE collection_id = ?", (collection_id,))
             connection.execute("DELETE FROM agent_runs WHERE collection_id = ?", (collection_id,))
             connection.execute("DELETE FROM jobs WHERE collection_id = ?", (collection_id,))
             connection.execute(
@@ -1001,3 +1034,146 @@ class Database:
                 (collection_id, limit),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    # --- Registro de horas por coleção -------------------------------------------------
+
+    def add_work_session(
+        self, collection_id: str, work_date: str, minutes: float, notes: str = "",
+    ) -> str:
+        """Lançamento manual de tempo trabalhado (minutos > 0 e até 24 h)."""
+        if not 0 < minutes <= MAX_WORK_MINUTES:
+            raise ValueError("Informe um tempo maior que zero e de no máximo 24 horas por lançamento.")
+        try:
+            work_date = date.fromisoformat(str(work_date)).isoformat()
+        except ValueError as error:
+            raise ValueError("Data do lançamento inválida.") from error
+        if len(notes) > 1000:
+            raise ValueError("A nota do lançamento deve ter no máximo 1000 caracteres.")
+        session_id = str(uuid.uuid4())
+        timestamp = utc_now()
+        with self.connect() as connection:
+            if connection.execute(
+                "SELECT 1 FROM collections WHERE id = ?", (collection_id,)
+            ).fetchone() is None:
+                raise KeyError("Coleção não encontrada.")
+            connection.execute(
+                "INSERT INTO work_sessions(id, collection_id, work_date, started_at, ended_at, "
+                "minutes, source, notes, created_at, updated_at) "
+                "VALUES (?, ?, ?, NULL, NULL, ?, 'manual', ?, ?, ?)",
+                (session_id, collection_id, work_date, float(minutes), notes.strip(), timestamp, timestamp),
+            )
+        return session_id
+
+    def start_timer(self, collection_id: str) -> str:
+        timestamp = utc_now()
+        session_id = str(uuid.uuid4())
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute(
+                "SELECT 1 FROM collections WHERE id = ?", (collection_id,)
+            ).fetchone() is None:
+                raise KeyError("Coleção não encontrada.")
+            running = connection.execute(
+                "SELECT w.id, c.name FROM work_sessions w JOIN collections c ON c.id = w.collection_id "
+                "WHERE w.source = 'timer' AND w.ended_at IS NULL LIMIT 1"
+            ).fetchone()
+            if running:
+                raise ValueError(
+                    f"Já existe um cronômetro aberto na coleção \"{running['name']}\". "
+                    "Pare ou descarte esse cronômetro antes de iniciar outro."
+                )
+            try:
+                connection.execute(
+                    "INSERT INTO work_sessions(id, collection_id, work_date, started_at, ended_at, "
+                    "minutes, source, notes, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, NULL, NULL, 'timer', '', ?, ?)",
+                    (session_id, collection_id, date.today().isoformat(), timestamp, timestamp, timestamp),
+                )
+            except sqlite3.IntegrityError as error:
+                raise ValueError(
+                    "Já existe um cronômetro aberto. Pare ou descarte-o antes de iniciar outro."
+                ) from error
+        return session_id
+
+    def open_timer(self) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT w.id, w.collection_id, c.name AS collection_name, w.started_at "
+                "FROM work_sessions w JOIN collections c ON c.id = w.collection_id "
+                "WHERE w.source = 'timer' AND w.ended_at IS NULL LIMIT 1"
+            ).fetchone()
+        return dict(row) if row else None
+
+    def stop_timer(
+        self, session_id: str, minutes_override: float | None = None,
+        max_minutes: float = 12 * 60,
+    ) -> float | None:
+        """Fecha o cronômetro e devolve os minutos gravados.
+
+        Acima de `max_minutes` (e sem `minutes_override`) levanta TimerTooLong e nada é gravado.
+        Com menos de 1 minuto medido (e sem override) a sessão é descartada e devolve None.
+        """
+        if minutes_override is not None and not 0 < minutes_override <= MAX_WORK_MINUTES:
+            raise ValueError("Informe um tempo maior que zero e de no máximo 24 horas por lançamento.")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT started_at FROM work_sessions "
+                "WHERE id = ? AND source = 'timer' AND ended_at IS NULL", (session_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("Não há cronômetro aberto com este identificador.")
+            ended = utc_now()
+            seconds = (datetime.fromisoformat(ended) - datetime.fromisoformat(row["started_at"])).total_seconds()
+            measured = round(max(seconds, 0) / 60, 2)
+            if minutes_override is None:
+                if measured > max_minutes:
+                    raise TimerTooLong(measured, max_minutes)
+                if measured < 1:
+                    connection.execute("DELETE FROM work_sessions WHERE id = ?", (session_id,))
+                    return None
+                minutes = measured
+            else:
+                minutes = round(float(minutes_override), 2)
+            connection.execute(
+                "UPDATE work_sessions SET ended_at = ?, minutes = ?, updated_at = ? WHERE id = ?",
+                (ended, minutes, ended, session_id),
+            )
+        return minutes
+
+    def discard_timer(self, session_id: str) -> None:
+        """Descarta um cronômetro ainda aberto; sessões fechadas nunca são apagadas por aqui."""
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM work_sessions WHERE id = ? AND source = 'timer' AND ended_at IS NULL",
+                (session_id,),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError("Só é possível descartar um cronômetro que ainda está aberto.")
+
+    def list_work_sessions(self, collection_id: str) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT id, work_date, started_at, ended_at, minutes, source, notes "
+                "FROM work_sessions WHERE collection_id = ? "
+                "ORDER BY work_date DESC, created_at DESC", (collection_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def delete_work_session(self, session_id: str) -> None:
+        """Exclusão explícita (UI com confirmação). Cronômetro aberto deve ser descartado."""
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM work_sessions WHERE id = ? AND minutes IS NOT NULL", (session_id,),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError("Lançamento não encontrado (ou cronômetro ainda aberto).")
+
+    def work_minutes_by_collection(self) -> dict[str, float]:
+        """Minutos por coleção, só de sessões fechadas (manuais e cronômetros parados)."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT collection_id, SUM(minutes) AS minutes FROM work_sessions "
+                "WHERE minutes IS NOT NULL GROUP BY collection_id"
+            ).fetchall()
+        return {row["collection_id"]: row["minutes"] or 0.0 for row in rows}
