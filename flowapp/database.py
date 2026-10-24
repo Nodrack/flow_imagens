@@ -8,9 +8,10 @@ from pathlib import Path
 from types import EllipsisType
 from typing import Any, get_args
 
+from flowapp.sales_import import to_micros, with_occurrences
 from flowapp.schemas import (
-    CollectionBrief, ConceptPlan, ModerationStatus, PerformanceEntry, STATE_TRANSITIONS,
-    WorkflowState,
+    CollectionBrief, ConceptPlan, ModerationStatus, MonthlySalesEntry, PerformanceEntry,
+    STATE_TRANSITIONS, WorkflowState,
 )
 
 
@@ -19,6 +20,22 @@ MAX_WORK_MINUTES = 24 * 60
 
 class InvalidTransition(ValueError):
     pass
+
+
+_ADOBE_SALES_DDL = """
+    CREATE TABLE IF NOT EXISTS adobe_sales (
+        id TEXT PRIMARY KEY,
+        moderation_record_id TEXT NOT NULL REFERENCES moderation_records(id),
+        sale_date TEXT NOT NULL, amount REAL NOT NULL, amount_micros INTEGER NOT NULL,
+        currency TEXT NOT NULL DEFAULT 'USD', occurrence INTEGER NOT NULL DEFAULT 1,
+        source_file TEXT NOT NULL DEFAULT '', imported_at TEXT NOT NULL,
+        UNIQUE(moderation_record_id, sale_date, amount_micros, occurrence)
+    )
+"""
+
+
+class ImportedMonthError(ValueError):
+    """Editar à mão um lançamento mensal vindo de importação exige confirmação."""
 
 
 class TimerTooLong(ValueError):
@@ -208,6 +225,19 @@ class Database:
                 CREATE INDEX IF NOT EXISTS ix_work_sessions_collection ON work_sessions(collection_id, work_date);
                 CREATE UNIQUE INDEX IF NOT EXISTS ux_work_sessions_open_timer
                     ON work_sessions((1)) WHERE source = 'timer' AND ended_at IS NULL;
+                CREATE TABLE IF NOT EXISTS monthly_sales (
+                    id TEXT PRIMARY KEY,
+                    collection_id TEXT REFERENCES collections(id),
+                    collection_name TEXT NOT NULL DEFAULT '',
+                    month TEXT NOT NULL, downloads INTEGER NOT NULL CHECK (downloads >= 0),
+                    revenue REAL NOT NULL CHECK (revenue >= 0), currency TEXT NOT NULL,
+                    notes TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS archived_work_minutes (
+                    detached_from TEXT PRIMARY KEY, collection_name TEXT NOT NULL,
+                    minutes REAL NOT NULL, manual_minutes REAL NOT NULL,
+                    revenue_json TEXT NOT NULL DEFAULT '{}', archived_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS moderation_records (
                     id TEXT PRIMARY KEY,
                     collection_id TEXT REFERENCES collections(id),
@@ -248,6 +278,37 @@ class Database:
                     connection.execute(
                         f"ALTER TABLE moderation_records ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
                     )
+            adobe_columns = {row["name"] for row in connection.execute("PRAGMA table_info(adobe_sales)")}
+            if adobe_columns and "amount_micros" not in adobe_columns:
+                # Versão anterior (UNIQUE em REAL): recria a tabela com a chave em micro-dólares.
+                connection.execute("ALTER TABLE adobe_sales RENAME TO adobe_sales_old")
+                connection.execute(_ADOBE_SALES_DDL)
+                connection.execute(
+                    "INSERT INTO adobe_sales(id, moderation_record_id, sale_date, amount, amount_micros, "
+                    "currency, occurrence, source_file, imported_at) SELECT id, moderation_record_id, "
+                    "sale_date, amount, CAST(ROUND(amount * 1000000) AS INTEGER), currency, occurrence, "
+                    "source_file, imported_at FROM adobe_sales_old"
+                )
+                connection.execute("DROP TABLE adobe_sales_old")
+            connection.execute(_ADOBE_SALES_DDL)
+            for table, extra in (
+                ("monthly_sales", (
+                    ("detached_from", "TEXT"),
+                    ("source", "TEXT NOT NULL DEFAULT 'manual' CHECK (source IN ('manual', 'import'))"),
+                )),
+                ("moderation_records", (("detached_from", "TEXT"), ("detached_name", "TEXT NOT NULL DEFAULT ''"))),
+            ):
+                existing_columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+                for column, definition in extra:
+                    # Origem (id e nome) de registros que sobrevivem à remoção da coleção.
+                    if column not in existing_columns:
+                        connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+            # Um lançamento por coleção (ou por coleção removida, via detached_from) e mês.
+            connection.execute("DROP INDEX IF EXISTS ux_monthly_sales_key")
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_monthly_sales_month ON monthly_sales("
+                "COALESCE(collection_id, detached_from, ''), month)"
+            )
             self._backfill_moderation(connection)
 
     @staticmethod
@@ -327,7 +388,7 @@ class Database:
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             collection = connection.execute(
-                "SELECT id FROM collections WHERE id = ?", (collection_id,)
+                "SELECT id, name FROM collections WHERE id = ?", (collection_id,)
             ).fetchone()
             if collection is None:
                 raise KeyError("Coleção não encontrada.")
@@ -361,10 +422,16 @@ class Database:
                             (collection_id,),
                         )
                 connection.execute("DELETE FROM pipeline_runs WHERE collection_id = ?", (collection_id,))
+            self._archive_work(connection, collection_id, collection["name"])
             connection.execute(
                 "DELETE FROM performance_records WHERE collection_id = ?", (collection_id,)
             )
             connection.execute("DELETE FROM work_sessions WHERE collection_id = ?", (collection_id,))
+            # Lançamentos mensais são histórico financeiro: ficam sem vínculo, com origem e nome.
+            connection.execute(
+                "UPDATE monthly_sales SET detached_from = collection_id, collection_name = ?, "
+                "collection_id = NULL WHERE collection_id = ?", (collection["name"], collection_id),
+            )
             connection.execute("DELETE FROM agent_runs WHERE collection_id = ?", (collection_id,))
             connection.execute("DELETE FROM jobs WHERE collection_id = ?", (collection_id,))
             connection.execute(
@@ -374,9 +441,11 @@ class Database:
             )
             # O histórico de moderação é preservado (sem vínculo) para continuar alimentando os agentes.
             connection.execute(
-                "UPDATE moderation_records SET concept_id = NULL, collection_id = NULL "
-                "WHERE collection_id = ?", (collection_id,),
+                "UPDATE moderation_records SET concept_id = NULL, detached_from = collection_id, "
+                "detached_name = ?, collection_id = NULL WHERE collection_id = ?",
+                (collection["name"], collection_id),
             )
+            self._recalculate_import_sales(connection)
             connection.execute("DELETE FROM assets WHERE collection_id = ?", (collection_id,))
             connection.execute("DELETE FROM concepts WHERE collection_id = ?", (collection_id,))
             connection.execute("DELETE FROM collections WHERE id = ?", (collection_id,))
@@ -531,37 +600,47 @@ class Database:
             adobe_id=adobe_id, notes=notes,
         )
 
-    def add_external_moderation(
-        self, title: str, status: str, collection_id: str | None = None, reason: str = "",
-        adobe_id: str = "", submitted_at: str | None = None, decided_at: str | None = None,
-        notes: str = "",
+    @staticmethod
+    def _insert_external(
+        connection: sqlite3.Connection, title: str, status: str, collection_id: str | None,
+        reason: str, adobe_id: str, submitted_at: str | None, decided_at: str | None, notes: str,
     ) -> str:
-        """Registra uma imagem enviada à Adobe fora do fluxo do app."""
+        """Cria o registro externo na transação do chamador."""
         title = title.strip()
         if not title:
             raise ValueError("Informe o título da imagem.")
         reason = _check_moderation(status, reason)
         record_id = str(uuid.uuid4())
         timestamp = utc_now()
-        with self.connect() as connection:
-            if collection_id is not None and connection.execute(
-                "SELECT 1 FROM collections WHERE id = ?", (collection_id,)
-            ).fetchone() is None:
-                raise KeyError("Coleção não encontrada.")
-            theme = ""
-            if collection_id is not None:
-                theme = json.loads(connection.execute(
-                    "SELECT brief_json FROM collections WHERE id = ?", (collection_id,)
-                ).fetchone()["brief_json"]).get("theme", "")
-            connection.execute(
-                "INSERT INTO moderation_records(id, collection_id, concept_id, title, status, reason, "
-                "adobe_id, submitted_at, decided_at, source, notes, theme, created_at, updated_at) "
-                "VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, 'external', ?, ?, ?, ?)",
-                (record_id, collection_id, title, status, reason, adobe_id.strip(), submitted_at,
-                 None if status == "pending" else (decided_at or timestamp),
-                 notes.strip(), theme, timestamp, timestamp),
-            )
+        if collection_id is not None and connection.execute(
+            "SELECT 1 FROM collections WHERE id = ?", (collection_id,)
+        ).fetchone() is None:
+            raise KeyError("Coleção não encontrada.")
+        theme = ""
+        if collection_id is not None:
+            theme = json.loads(connection.execute(
+                "SELECT brief_json FROM collections WHERE id = ?", (collection_id,)
+            ).fetchone()["brief_json"]).get("theme", "")
+        connection.execute(
+            "INSERT INTO moderation_records(id, collection_id, concept_id, title, status, reason, "
+            "adobe_id, submitted_at, decided_at, source, notes, theme, created_at, updated_at) "
+            "VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, 'external', ?, ?, ?, ?)",
+            (record_id, collection_id, title, status, reason, adobe_id.strip(), submitted_at,
+             None if status == "pending" else (decided_at or timestamp),
+             notes.strip(), theme, timestamp, timestamp),
+        )
         return record_id
+
+    def add_external_moderation(
+        self, title: str, status: str, collection_id: str | None = None, reason: str = "",
+        adobe_id: str = "", submitted_at: str | None = None, decided_at: str | None = None,
+        notes: str = "",
+    ) -> str:
+        """Registra uma imagem enviada à Adobe fora do fluxo do app."""
+        with self.connect() as connection:
+            return self._insert_external(
+                connection, title, status, collection_id, reason, adobe_id, submitted_at, decided_at, notes,
+            )
 
     def update_moderation_record(
         self, record_id: str, *, status: str, reason: str = "", adobe_id: str = "", notes: str = "",
@@ -595,7 +674,7 @@ class Database:
     def list_moderation(self, collection_id: str | None | EllipsisType = ...) -> list[dict[str, Any]]:
         """Registros de uma coleção (None = sem coleção); sem argumento, todos."""
         query = (
-            "SELECT m.*, col.name AS collection_name FROM moderation_records m "
+            "SELECT m.*, COALESCE(col.name, m.detached_name) AS collection_name FROM moderation_records m "
             "LEFT JOIN collections col ON col.id = m.collection_id"
         )
         params: tuple[Any, ...] = ()
@@ -1032,6 +1111,366 @@ class Database:
                 "generation_seconds, upscale_seconds, manual_minutes, user_cost, cost_currency, notes "
                 "FROM performance_records WHERE collection_id = ? ORDER BY report_date DESC LIMIT ?",
                 (collection_id, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    @staticmethod
+    def _archive_work(connection: sqlite3.Connection, collection_id: str, name: str) -> None:
+        """Guarda horas e receita avulsa da coleção antes de apagá-las, para a receita/hora total
+        não inflar ao remover (os lançamentos mensais continuam, vinculados por detached_from)."""
+        minutes = connection.execute(
+            "SELECT COALESCE(SUM(minutes), 0) AS total FROM work_sessions "
+            "WHERE collection_id = ? AND minutes IS NOT NULL", (collection_id,),
+        ).fetchone()["total"]
+        manual = connection.execute(
+            "SELECT COALESCE(SUM(manual_minutes), 0) AS total FROM performance_records "
+            "WHERE collection_id = ?", (collection_id,),
+        ).fetchone()["total"]
+        revenue = {
+            row["revenue_currency"]: row["total"] for row in connection.execute(
+                "SELECT revenue_currency, SUM(revenue) AS total FROM performance_records "
+                "WHERE collection_id = ? GROUP BY revenue_currency", (collection_id,),
+            )
+        }
+        if minutes or manual or revenue:
+            connection.execute(
+                "INSERT INTO archived_work_minutes(detached_from, collection_name, minutes, "
+                "manual_minutes, revenue_json, archived_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (collection_id, name, minutes, manual, json.dumps(revenue), utc_now()),
+            )
+
+    def list_archived_work(self) -> list[dict[str, Any]]:
+        """Horas e receita avulsa de coleções removidas (uma linha por coleção)."""
+        with self.connect() as connection:
+            rows = connection.execute("SELECT * FROM archived_work_minutes").fetchall()
+        return [
+            {**dict(row), "revenue": json.loads(row["revenue_json"] or "{}")} for row in rows
+        ]
+
+    # --- Downloads e receita mensais -----------------------------------------------------
+
+    def upsert_monthly_sales(
+        self, collection_id: str | None, month: str, downloads: int, revenue: float,
+        currency: str, notes: str = "", confirm_import_override: bool = False,
+    ) -> str:
+        """Lança o mês; repetir o mês da mesma coleção substitui o valor, inclusive a moeda (correção).
+
+        Uma linha vinda de importação só é editada com `confirm_import_override`; ela vira manual.
+        """
+        entry = MonthlySalesEntry(
+            month=month, downloads=downloads, revenue=revenue, currency=currency, notes=notes.strip(),
+        )
+        timestamp = utc_now()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if collection_id is not None and connection.execute(
+                "SELECT 1 FROM collections WHERE id = ?", (collection_id,)
+            ).fetchone() is None:
+                raise KeyError("Coleção não encontrada.")
+            if collection_id is None:
+                existing = connection.execute(
+                    "SELECT id, source FROM monthly_sales WHERE collection_id IS NULL "
+                    "AND detached_from IS NULL AND month = ?", (entry.month,),
+                ).fetchone()
+            else:
+                existing = connection.execute(
+                    "SELECT id, source FROM monthly_sales WHERE collection_id = ? AND month = ?",
+                    (collection_id, entry.month),
+                ).fetchone()
+            if existing:
+                if existing["source"] == "import" and not confirm_import_override:
+                    raise ImportedMonthError(
+                        "Este mês foi importado dos ganhos da Adobe. Confirme para substituí-lo por um "
+                        "lançamento manual (a linha passa a ser manual)."
+                    )
+                connection.execute(
+                    "UPDATE monthly_sales SET downloads = ?, revenue = ?, currency = ?, notes = ?, "
+                    "source = 'manual', updated_at = ? WHERE id = ?",
+                    (entry.downloads, entry.revenue, entry.currency, entry.notes, timestamp, existing["id"]),
+                )
+                return existing["id"]
+            sale_id = str(uuid.uuid4())
+            connection.execute(
+                "INSERT INTO monthly_sales(id, collection_id, collection_name, month, downloads, "
+                "revenue, currency, notes, created_at, updated_at) VALUES (?, ?, '', ?, ?, ?, ?, ?, ?, ?)",
+                (sale_id, collection_id, entry.month, entry.downloads, entry.revenue, entry.currency,
+                 entry.notes, timestamp, timestamp),
+            )
+        return sale_id
+
+    def list_monthly_sales(self, collection_id: str | None | EllipsisType = ...) -> list[dict[str, Any]]:
+        """Lançamentos de uma coleção (None = sem coleção/removidas); sem argumento, todos."""
+        query = (
+            "SELECT s.id, s.collection_id, COALESCE(c.name, s.collection_name) AS collection_name, "
+            "s.detached_from, s.month, s.downloads, s.revenue, s.currency, s.notes, s.source FROM monthly_sales s "
+            "LEFT JOIN collections c ON c.id = s.collection_id"
+        )
+        params: tuple[Any, ...] = ()
+        if collection_id is None:
+            query += " WHERE s.collection_id IS NULL"
+        elif collection_id is not ...:
+            query += " WHERE s.collection_id = ?"
+            params = (collection_id,)
+        with self.connect() as connection:
+            rows = connection.execute(query + " ORDER BY s.month DESC, collection_name", params).fetchall()
+        return [dict(row) for row in rows]
+
+    def delete_monthly_sales(self, sale_id: str) -> None:
+        """Exclusão explícita (UI com confirmação).
+
+        Roda o recálculo: uma linha 'import' excluída volta a refletir as vendas importadas, e um
+        mês manual que tenha vendas importadas ganha de volta a linha 'import'.
+        """
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute("DELETE FROM monthly_sales WHERE id = ?", (sale_id,)).rowcount == 0:
+                raise KeyError("Lançamento mensal não encontrado.")
+            self._recalculate_import_sales(connection)
+
+    # --- Importação do CSV de ganhos da Adobe ------------------------------------------------
+
+    @staticmethod
+    def _record_key(connection: sqlite3.Connection, record_id: str) -> tuple[str | None, str | None]:
+        record = connection.execute(
+            "SELECT collection_id, detached_from FROM moderation_records WHERE id = ?", (record_id,)
+        ).fetchone()
+        if record is None:
+            raise KeyError("Registro de moderação não encontrado.")
+        return record["collection_id"], record["detached_from"]
+
+    def _manual_months(
+        self, connection: sqlite3.Connection, key: tuple[str | None, str | None], months: list[str],
+    ) -> list[dict[str, Any]]:
+        collection_id, detached_from = key
+        if collection_id:
+            where, params = "collection_id = ?", (collection_id,)
+        elif detached_from:
+            where, params = "collection_id IS NULL AND detached_from = ?", (detached_from,)
+        else:
+            where, params = "collection_id IS NULL AND detached_from IS NULL", ()
+        rows = [
+            dict(row) for row in connection.execute(
+                f"SELECT id, month, downloads, revenue, currency FROM monthly_sales "
+                f"WHERE source = 'manual' AND {where} ORDER BY month", params,
+            )
+        ]
+        return [row for row in rows if row["month"] in months]
+
+    def import_conflicts(
+        self, months: list[str], *, record_id: str | None = None, collection_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Lançamentos manuais que a importação tocaria (mesma coleção da imagem e mesmo mês)."""
+        with self.connect() as connection:
+            key = self._record_key(connection, record_id) if record_id else (collection_id, None)
+            return self._manual_months(connection, key, months)
+
+    def count_existing_adobe_sales(self, record_id: str, sales: list[tuple[str, float]]) -> int:
+        """Quantas vendas do arquivo já estão importadas para a imagem (prévia da reimportação)."""
+        with self.connect() as connection:
+            existing = {
+                (row["sale_date"], row["amount_micros"], row["occurrence"]) for row in connection.execute(
+                    "SELECT sale_date, amount_micros, occurrence FROM adobe_sales "
+                    "WHERE moderation_record_id = ?", (record_id,),
+                )
+            }
+        return sum(
+            1 for sale_date, amount, occurrence in with_occurrences(sales)
+            if (sale_date, to_micros(amount), occurrence) in existing
+        )
+
+    def find_moderation_by_adobe_id(self, adobe_id: str) -> dict[str, Any] | None:
+        adobe_id = adobe_id.strip()
+        if not adobe_id:
+            return None
+        with self.connect() as connection:
+            return self._find_by_adobe_id(connection, adobe_id)
+
+    @staticmethod
+    def _find_by_adobe_id(connection: sqlite3.Connection, adobe_id: str) -> dict[str, Any] | None:
+        row = connection.execute(
+            "SELECT id, title, status, collection_id FROM moderation_records WHERE adobe_id = ? "
+            "ORDER BY created_at LIMIT 1", (adobe_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def import_adobe_sales(
+        self, record_id: str | None, sales: list[tuple[str, float]], source_file: str = "",
+        replace_manual: bool | set[str] = False, new_image: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Importa as vendas de uma imagem e atualiza os lançamentos mensais 'import', numa transação.
+
+        `new_image` ({title, adobe_id, collection_id, submitted_at}) cria o registro externo aprovado
+        na mesma transação, reutilizando um registro com o mesmo ID Adobe (busca refeita dentro dela).
+        Idempotente. A imagem fica aprovada e o decided_at nunca fica depois da primeira venda.
+        `replace_manual` (True = todos, ou um conjunto de meses 'AAAA-MM') troca lançamentos manuais
+        do mesmo mês pelos dados importados; do contrário eles ficam como estão.
+        """
+        if not sales:
+            raise ValueError("O arquivo não tem vendas válidas para importar.")
+        timestamp = utc_now()
+        first_date = min(sale_date for sale_date, _ in sales)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            created = False
+            if record_id is None:
+                if not new_image:
+                    raise ValueError("Informe a imagem das vendas.")
+                reused = self._find_by_adobe_id(connection, (new_image.get("adobe_id") or "").strip()) \
+                    if (new_image.get("adobe_id") or "").strip() else None
+                if reused:
+                    record_id = reused["id"]
+                else:
+                    record_id = self._insert_external(
+                        connection, new_image["title"], "approved", new_image.get("collection_id"), "",
+                        new_image.get("adobe_id") or "", new_image.get("submitted_at"),
+                        f"{first_date}T00:00:00+00:00", "",
+                    )
+                    created = True
+            record = connection.execute(
+                "SELECT concept_id, status FROM moderation_records WHERE id = ?", (record_id,)
+            ).fetchone()
+            if record is None:
+                raise KeyError("Registro de moderação não encontrado.")
+            new = 0
+            for sale_date, amount, occurrence in with_occurrences(sales):
+                new += connection.execute(
+                    "INSERT OR IGNORE INTO adobe_sales(id, moderation_record_id, sale_date, amount, "
+                    "amount_micros, currency, occurrence, source_file, imported_at) "
+                    "VALUES (?, ?, ?, ?, ?, 'USD', ?, ?, ?)",
+                    (str(uuid.uuid4()), record_id, sale_date, amount, to_micros(amount), occurrence,
+                     source_file[:200], timestamp),
+                ).rowcount
+            first_sale = connection.execute(
+                "SELECT MIN(sale_date) AS first FROM adobe_sales WHERE moderation_record_id = ?", (record_id,)
+            ).fetchone()["first"]
+            target = f"{first_sale}T00:00:00+00:00"
+            marked = record["status"] != "approved"
+            if marked:
+                if record["concept_id"]:
+                    self._set_moderation(connection, record["concept_id"], "approved", "", None, None)
+                else:
+                    connection.execute(
+                        "UPDATE moderation_records SET status = 'approved', reason = '', decided_at = ?, "
+                        "updated_at = ? WHERE id = ?", (target, timestamp, record_id),
+                    )
+            decided = connection.execute(
+                "SELECT decided_at FROM moderation_records WHERE id = ?", (record_id,)
+            ).fetchone()["decided_at"]
+            if decided is None or decided > target:
+                connection.execute(
+                    "UPDATE moderation_records SET decided_at = ?, updated_at = ? WHERE id = ?",
+                    (target, timestamp, record_id),
+                )
+            collection_id, detached_from = self._record_key(connection, record_id)
+            months = sorted({sale_date[:7] for sale_date, _ in sales})
+            conflicts = self._manual_months(connection, (collection_id, detached_from), months)
+            if replace_manual is True:
+                chosen = {row["month"] for row in conflicts}
+            else:
+                chosen = {row["month"] for row in conflicts} & set(replace_manual or ())
+            replace = {(collection_id, detached_from, month) for month in chosen}
+            self._recalculate_import_sales(connection, replace)
+        return {
+            "record_id": record_id, "created": created, "new": new, "existing": len(sales) - new,
+            "marked_approved": marked, "conflict_months": [row["month"] for row in conflicts],
+            "replaced_months": sorted(chosen), "replaced_manual": bool(chosen),
+        }
+
+    def delete_adobe_sales(self, record_id: str, source_file: str | None = None) -> int:
+        """Desfaz importações: apaga as vendas da imagem (ou só as de um arquivo) e recalcula os meses.
+
+        Não mexe no registro de moderação. Devolve quantas vendas foram removidas.
+        """
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if source_file is None:
+                removed = connection.execute(
+                    "DELETE FROM adobe_sales WHERE moderation_record_id = ?", (record_id,)
+                ).rowcount
+            else:
+                removed = connection.execute(
+                    "DELETE FROM adobe_sales WHERE moderation_record_id = ? AND source_file = ?",
+                    (record_id, source_file[:200]),
+                ).rowcount
+            self._recalculate_import_sales(connection)
+        return removed
+
+    def recalculate_import_sales(self) -> None:
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._recalculate_import_sales(connection)
+
+    @staticmethod
+    def _recalculate_import_sales(
+        connection: sqlite3.Connection,
+        replace_manual: set[tuple[str | None, str | None, str]] = frozenset(),
+    ) -> None:
+        """Refaz as linhas 'import' de monthly_sales a partir das vendas e da coleção atual de cada imagem.
+
+        Downloads = nº de vendas, receita = soma (USD) por (coleção da imagem, mês). Linhas manuais
+        só mudam se a chave estiver em `replace_manual`; linhas 'import' sem vendas somem.
+        """
+        groups = connection.execute(
+            "SELECT m.collection_id, m.detached_from, MAX(m.detached_name) AS detached_name, "
+            "substr(a.sale_date, 1, 7) AS month, COUNT(*) AS n, SUM(a.amount) AS total "
+            "FROM adobe_sales a JOIN moderation_records m ON m.id = a.moderation_record_id "
+            "GROUP BY m.collection_id, m.detached_from, substr(a.sale_date, 1, 7)"
+        ).fetchall()
+        timestamp = utc_now()
+        keep: set[str] = set()
+        for group in groups:
+            collection_id, detached_from = group["collection_id"], group["detached_from"]
+            if collection_id:
+                where, params = "collection_id = ?", (collection_id,)
+            elif detached_from:
+                where, params = "collection_id IS NULL AND detached_from = ?", (detached_from,)
+            else:
+                where, params = "collection_id IS NULL AND detached_from IS NULL", ()
+            existing = connection.execute(
+                f"SELECT id, source, downloads, revenue, currency FROM monthly_sales "
+                f"WHERE {where} AND month = ?", (*params, group["month"]),
+            ).fetchone()
+            if existing:
+                keep.add(existing["id"])
+                if existing["source"] == "manual" and (collection_id, detached_from, group["month"]) not in replace_manual:
+                    continue
+                note = "Importado do CSV de ganhos da Adobe"
+                if existing["source"] == "manual":
+                    note += (
+                        f"; manual anterior: {existing['downloads']} downloads, "
+                        f"{existing['revenue']:.2f} {existing['currency']}"
+                    )
+                connection.execute(
+                    "UPDATE monthly_sales SET downloads = ?, revenue = ?, currency = 'USD', "
+                    "notes = ?, source = 'import', updated_at = ? WHERE id = ?",
+                    (group["n"], group["total"], note, timestamp, existing["id"]),
+                )
+                continue
+            sale_id = str(uuid.uuid4())
+            keep.add(sale_id)
+            connection.execute(
+                "INSERT INTO monthly_sales(id, collection_id, collection_name, detached_from, month, "
+                "downloads, revenue, currency, notes, source, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'USD', 'Importado do CSV de ganhos da Adobe', 'import', ?, ?)",
+                (sale_id, collection_id, (group["detached_name"] or "") if detached_from and not collection_id else "",
+                 detached_from if not collection_id else None, group["month"], group["n"], group["total"],
+                 timestamp, timestamp),
+            )
+        for row in connection.execute("SELECT id FROM monthly_sales WHERE source = 'import'").fetchall():
+            if row["id"] not in keep:
+                connection.execute("DELETE FROM monthly_sales WHERE id = ?", (row["id"],))
+
+    def list_adobe_sales_summary(self) -> list[dict[str, Any]]:
+        """Vendas importadas por imagem, para conferência."""
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT m.id AS record_id, m.title, m.adobe_id, "
+                "COALESCE(col.name, m.detached_name) AS collection_name, m.detached_from, "
+                "COUNT(*) AS sales, SUM(a.amount) AS revenue, MIN(a.sale_date) AS first_sale, "
+                "MAX(a.sale_date) AS last_sale FROM adobe_sales a "
+                "JOIN moderation_records m ON m.id = a.moderation_record_id "
+                "LEFT JOIN collections col ON col.id = m.collection_id "
+                "GROUP BY m.id ORDER BY revenue DESC"
             ).fetchall()
         return [dict(row) for row in rows]
 

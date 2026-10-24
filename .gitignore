@@ -14,3 +14,6 @@ data/
 *.bak[0-9]*
 *.bak-*
 *.before_*
+
+# Relatórios financeiros exportados do portal Adobe
+earnings*.csv

@@ -3,8 +3,9 @@ from __future__ import annotations
 import base64
 import json
 import os
+import sqlite3
 import webbrowser
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time
 from pathlib import Path
 from typing import Any
 
@@ -34,13 +35,17 @@ from flowapp.agents import AgentError, INSTRUCTION_VERSION, adobe_lessons
 from flowapp.comfy import ComfyError
 from flowapp.config import AppConfig, load_config, save_config
 from flowapp.database import (
-    APPROVAL_PREFIX, Database, DuplicateJobError, InvalidTransition, MAX_WORK_MINUTES,
-    REJECTION_PREFIX, TimerTooLong,
+    APPROVAL_PREFIX, Database, DuplicateJobError, InvalidTransition,
+    MAX_WORK_MINUTES, REJECTION_PREFIX, TimerTooLong,
 )
 from flowapp.images import ImageStore, ImageValidationError
-from flowapp.metrics import format_hours, format_per_hour, revenue_per_hour
+from flowapp.metrics import (
+    approval_rate, approved_per_week, collection_key, downloads_per_approved, format_hours,
+    format_per_hour, revenue_per_hour,
+)
 from flowapp.moderation import MODERATION_BY_LABEL, MODERATION_LABELS, moderation_changes
 from flowapp.orchestrator import Orchestrator
+from flowapp.sales_import import parse_adobe_earnings
 from flowapp.pipeline import (
     AgentPipeline, final_upscale, metadata_approval_targets, metadata_targets, upscale_targets,
 )
@@ -52,6 +57,7 @@ from flowapp.profiles import (
     save_profile,
 )
 from flowapp.schemas import (
+    LOCAL_TZ,
     CollectionBrief,
     ComfyWorkflowProfile,
     ConceptPlan,
@@ -2067,99 +2073,524 @@ def render_work_hours(orchestrator: Orchestrator, collection_id: str) -> None:
                         show_error(error)
 
 
-def render_performance(orchestrator: Orchestrator, collection_id: str | None) -> None:
-    st.subheader("Resultados e custos informados")
-    st.caption("Registre dados conferidos manualmente ou provenientes de relatórios oficiais disponíveis. Não há projeção de ganhos.")
-    if collection_id:
-        concepts = orchestrator.database.list_concepts(collection_id)
-        concept_options = [""] + [concept["id"] for concept in concepts]
-        with st.form("performance_entry"):
-            report_date = st.date_input("Data do relatório", value=date.today())
-            concept_id = st.selectbox(
-                "Conceito (opcional)", concept_options,
-                format_func=lambda value: "Coleção inteira" if not value else next(
-                    item["data"]["concept"] for item in concepts if item["id"] == value
-                ),
-            )
-            downloads = st.number_input("Downloads", min_value=0, step=1)
-            revenue_columns = st.columns(2)
-            revenue = revenue_columns[0].number_input("Receita registrada", min_value=0.0, step=0.1)
-            revenue_currency = revenue_columns[1].selectbox("Moeda da receita", ["USD", "EUR", "BRL", "CAD", "AUD"])
-            moderation = st.selectbox("Resultado de moderação", ["unknown", "pending", "accepted", "rejected"], format_func={
-                "unknown": "Não informado", "pending": "Pendente", "accepted": "Aceito", "rejected": "Rejeitado"
-            }.get)
-            time_columns = st.columns(3)
-            generation_seconds = time_columns[0].number_input("Geração (segundos)", min_value=0.0, step=1.0)
-            upscale_seconds = time_columns[1].number_input("Upscale (segundos)", min_value=0.0, step=1.0)
-            manual_minutes = time_columns[2].number_input("Tempo manual (minutos)", min_value=0.0, step=1.0)
-            cost_columns = st.columns(2)
-            user_cost = cost_columns[0].number_input("Custo informado", min_value=0.0, step=0.1)
-            cost_currency = cost_columns[1].selectbox("Moeda do custo", ["USD", "EUR", "BRL", "CAD", "AUD"])
-            notes = st.text_area("Nota ou fonte do registro", max_chars=1000)
-            save = st.form_submit_button("Registrar dados", type="primary")
-        if save:
-            try:
-                entry = PerformanceEntry(
-                    report_date=report_date,
-                    download_count=int(downloads),
-                    revenue=revenue,
-                    revenue_currency=revenue_currency,
-                    moderation_status=moderation,
-                    generation_seconds=generation_seconds,
-                    upscale_seconds=upscale_seconds,
-                    manual_minutes=manual_minutes,
-                    user_cost=user_cost,
-                    cost_currency=cost_currency,
-                    notes=notes,
-                )
-                orchestrator.database.record_performance(collection_id, entry, concept_id or None)
-                st.success("Registro salvo. A comparação usa somente os dados informados.")
-                st.rerun()
-            except (ValidationError, ValueError) as error:
-                show_error(error)
-        records = orchestrator.database.list_performance(collection_id)
-        if records:
-            st.markdown("#### Registros desta coleção")
-            st.dataframe(records, width="stretch", hide_index=True)
-        render_work_hours(orchestrator, collection_id)
+def collection_labels(
+    database: Database, *row_groups: list[dict[str, Any]],
+) -> dict[str | None, str]:
+    """Nome de cada chave de coleção; removidas aparecem como "<nome> (removida)"."""
+    labels: dict[str | None, str] = {item["id"]: item["name"] for item in database.list_collections()}
+    for rows in row_groups:
+        for row in rows:
+            key = collection_key({"collection_id": row.get("collection_id"), "detached_from": row.get("detached_from")})
+            if key and key not in labels:
+                labels[key] = f"{row.get('collection_name') or 'Coleção'} (removida)"
+    labels[None] = "Sem coleção"
+    return labels
 
-    comparisons = orchestrator.database.performance_comparison()
-    hours_metrics = revenue_per_hour(comparisons, orchestrator.database.work_minutes_by_collection())
-    today = date.today()
-    for row in comparisons:
-        created = datetime.fromisoformat(row["created_at"]).date()
-        row["idade_dias"] = max((today - created).days, 0)
-        row["receita/moeda"] = (
-            f"{row['revenue'] or 0:.2f} {row['revenue_currency']}"
-            if row["revenue_currency"] else "sem registros"
+
+def render_indicators(
+    database: Database, sales: list[dict[str, Any]], hours_metrics: dict[str, Any],
+    archived: list[dict[str, Any]],
+) -> None:
+    st.markdown("#### Indicadores")
+    moderation = database.list_moderation()
+    rates = approval_rate(moderation)
+    weekly = approved_per_week(moderation, datetime.now(UTC))
+    per_image = downloads_per_approved(sales, moderation)
+    latest = max(per_image["total"]) if per_image["total"] else None
+    total_rate = rates["total"]["rate"]
+    per_hour_items = [
+        f"{values['per_hour']:.2f} {currency}/h"
+        for currency, values in hours_metrics["total"]["by_currency"].items()
+        if values["per_hour"] is not None
+    ]
+    columns = st.columns(4)
+    columns[0].metric(
+        "Taxa de aprovação", "-" if total_rate is None else f"{total_rate:.0%}",
+        help="Aprovadas / (aprovadas + rejeitadas); pendentes ficam fora.",
+    )
+    columns[1].metric(
+        "Aprovadas por semana", "-" if weekly["average"] is None else f"{weekly['average']:.1f}",
+        help="Média das semanas completas entre as últimas 12 (Europe/Madrid), a partir da semana da "
+        "primeira aprovação; a semana em curso fica de fora da média.",
+    )
+    last_value = per_image["total"][latest]["per_image"] if latest else None
+    columns[2].metric(
+        f"Downloads por aprovada ({latest})" if latest else "Downloads por aprovada",
+        "-" if last_value is None else f"{last_value:.2f}",
+        help="Downloads do último mês lançado / imagens aprovadas acumuladas até o fim dele.",
+    )
+    columns[3].metric(
+        "Receita por hora", " · ".join(per_hour_items) if per_hour_items else "-",
+        help="Receita de cada moeda / horas totais (sessões + tempo manual). Sem horas: \"-\".",
+    )
+    import pandas as pd
+
+    chart = pd.DataFrame(
+        {"aprovadas": [item["approved"] for item in weekly["series"]]},
+        index=[item["week"] for item in weekly["series"]],
+    )
+    st.caption("Imagens aprovadas por semana (últimas 12; a última barra é a semana em curso)")
+    st.bar_chart(chart)
+    labels = collection_labels(database, moderation, sales, archived)
+    keys = set(rates["collections"]) | set(per_image["collections"]) | set(hours_metrics["collections"])
+    table = []
+    for key in sorted(keys, key=lambda value: (value is None, str(value).startswith("removida:"), labels.get(value, ""))):
+        rate = rates["collections"].get(key, {}).get("rate")
+        weekly_collection = approved_per_week(
+            [row for row in moderation if collection_key(row) == key], datetime.now(UTC),
         )
-    if comparisons:
-        st.markdown("#### Comparação por coleção")
+        months = per_image["collections"].get(key, {})
+        last_month = max(months) if months else None
+        per_hour = [
+            format_per_hour(values["per_hour"], currency)
+            for currency, values in hours_metrics["collections"].get(key, {}).get("by_currency", {}).items()
+        ]
+        table.append({
+            "coleção": labels.get(key, "Coleção removida"),
+            "taxa de aprovação": None if rate is None else round(rate * 100, 1),
+            "aprovadas/semana (12 sem.)": None if weekly_collection["average"] is None else round(weekly_collection["average"], 2),
+            "downloads por aprovada": None if last_month is None or months[last_month]["per_image"] is None else round(months[last_month]["per_image"], 2),
+            "mês de referência": last_month,
+            "receita/hora": " · ".join(per_hour) if per_hour else None,
+        })
+    if table:
+        st.dataframe(
+            table, width="stretch", hide_index=True,
+            column_config={"taxa de aprovação": st.column_config.NumberColumn(format="%.1f%%")},
+        )
+    st.caption(
+        "Valores informados manualmente e conferidos no painel da Adobe; sem conversão de moedas nem projeção. "
+        "\"Sem coleção\" reúne imagens e lançamentos fora do fluxo; coleções removidas aparecem pelo nome, "
+        "com as horas arquivadas na remoção. Aprovada sem data de decisão usa a data de envio ou da "
+        "última atualização. Células vazias significam sem dados (sem decisões, sem horas ou sem aprovadas)."
+    )
+
+
+def render_adobe_import(orchestrator: Orchestrator, collection_id: str | None) -> None:
+    database = orchestrator.database
+    st.markdown("#### Importar ganhos da Adobe")
+    st.caption(
+        "No portal: Insights → Ganancias → selecione a imagem → baixar CSV (um arquivo por imagem, sem ID). "
+        "Escolha abaixo de qual imagem é cada arquivo. Os arquivos não são gravados em disco; as vendas "
+        "importadas alimentam os lançamentos mensais (marcados como importado) e reimportar não duplica."
+    )
+    for level, text in st.session_state.pop("adobe_import_messages", []):
+        getattr(st, level)(text)
+    nonce = st.session_state.get("adobe_import_nonce", 0)
+    files = st.file_uploader(
+        "Arquivos CSV de ganhos", type=["csv"], accept_multiple_files=True, key=f"adobe_import_files_{nonce}",
+    )
+    plan: list[dict[str, Any]] = []
+    skipped: list[str] = []
+    problems: list[str] = []
+    if files:
+        records = database.list_moderation()
+        record_by_id = {row["id"]: row for row in records}
+        names = {item["id"]: item["name"] for item in database.list_collections()}
+        for file in files:
+            parsed = parse_adobe_earnings(file.getvalue())
+            with st.container(border=True):
+                st.markdown(f"**{file.name}**")
+                columns = st.columns(3)
+                columns[0].metric("Vendas", len(parsed.sales))
+                columns[1].metric("Total", f"{parsed.total:.2f} USD")
+                columns[2].metric("Meses", ", ".join(parsed.months) or "-")
+                if parsed.errors:
+                    st.error("Linhas inválidas (corrija o arquivo; ele não será importado):\n\n" + "\n".join(
+                        f"- {error}" for error in parsed.errors[:20]
+                    ))
+                    skipped.append(f"{file.name}: ignorado, {len(parsed.errors)} linha(s) inválida(s).")
+                    continue
+                if not parsed.sales:
+                    st.warning("Nenhuma venda encontrada neste arquivo.")
+                    skipped.append(f"{file.name}: ignorado, nenhuma venda encontrada.")
+                    continue
+                key = f"adobe_import_{file.file_id}"
+                options = ["__new__"] + [row["id"] for row in records]
+                target = st.selectbox(
+                    "Esta venda é da imagem…", options, key=f"{key}_target",
+                    format_func=lambda value: "Nova imagem fora do fluxo" if value == "__new__" else (
+                        f"{record_by_id[value]['title']} · {record_by_id[value]['adobe_id'] or 'sem ID'} · "
+                        f"{record_by_id[value].get('collection_name') or 'Sem coleção'}"
+                    ),
+                )
+                new_image: dict[str, Any] | None = None
+                record_id = target if target != "__new__" else None
+                if target == "__new__":
+                    fields = st.columns(2)
+                    title = fields[0].text_input("Título da imagem", key=f"{key}_title")
+                    adobe_id = fields[1].text_input("ID Adobe", key=f"{key}_adobe_id")
+                    more = st.columns(2)
+                    coll_options = [""] + list(names)
+                    target_collection = more[0].selectbox(
+                        "Coleção", coll_options, key=f"{key}_collection",
+                        index=coll_options.index(collection_id) if collection_id in coll_options else 0,
+                        format_func=lambda value: names.get(value, "Sem coleção"),
+                    ) or None
+                    submitted_on = more[1].date_input("Data de envio (opcional)", value=None, key=f"{key}_submitted")
+                    reused = database.find_moderation_by_adobe_id(adobe_id)
+                    if reused:
+                        st.info(f"O ID Adobe já existe no registro \"{reused['title']}\": as vendas vão para ele.")
+                        record_id = reused["id"]
+                    elif not title.strip():
+                        st.warning("Informe o título da nova imagem para importar este arquivo.")
+                        problems.append(f"Informe o título da imagem em {file.name}.")
+                        continue
+                    else:
+                        new_image = {
+                            "title": title, "adobe_id": adobe_id.strip(), "collection_id": target_collection,
+                            "submitted_at": submitted_on.isoformat() if submitted_on else None,
+                        }
+                plan.append({
+                    "name": file.name, "sales": parsed.sales, "months": parsed.months,
+                    "record_id": record_id, "new_image": new_image,
+                })
+                notes: list[str] = []
+                if record_id:
+                    already = database.count_existing_adobe_sales(record_id, parsed.sales)
+                    notes.append(f"{len(parsed.sales) - already} venda(s) nova(s) e {already} já importada(s).")
+                    if record_by_id.get(record_id, {}).get("status", "approved") != "approved":
+                        notes.append("A imagem será marcada como aprovada (decided_at na data da primeira venda).")
+                else:
+                    notes.append(f"{len(parsed.sales)} venda(s) nova(s); a imagem será criada como aprovada.")
+                st.caption(" ".join(notes))
+        # Dois arquivos "nova imagem" sem ID e com o mesmo título seriam duas imagens iguais: exige distinguir.
+        seen_titles: dict[str, str] = {}
+        for item in plan:
+            image = item["new_image"]
+            if image and not image["adobe_id"]:
+                title_key = image["title"].strip().casefold()
+                if title_key in seen_titles:
+                    message = (
+                        f"{item['name']} e {seen_titles[title_key]} são \"Nova imagem\" sem ID Adobe e com o mesmo "
+                        f"título (\"{image['title'].strip()}\"): informe o ID Adobe ou mude o título para distingui-las."
+                    )
+                    st.warning(message)
+                    problems.append(message)
+                seen_titles.setdefault(title_key, item["name"])
+        # Conflitos com lançamento manual: uma decisão por (coleção, mês) para o lote inteiro.
+        pairs: dict[tuple[str | None, str | None, str], dict[str, Any]] = {}
+        for item in plan:
+            if item["record_id"]:
+                record = record_by_id.get(item["record_id"], {})
+                pair_key = (record.get("collection_id"), record.get("detached_from"))
+                found = database.import_conflicts(item["months"], record_id=item["record_id"])
+                label = record.get("collection_name") or "Sem coleção"
+                title = record.get("title", "")
+            else:
+                image = item["new_image"]
+                pair_key = (image["collection_id"], None)
+                found = database.import_conflicts(item["months"], collection_id=image["collection_id"])
+                label = names.get(image["collection_id"], "Sem coleção")
+                title = image["title"]
+            item["pair_key"] = pair_key
+            for row in found:
+                pair = pairs.setdefault((*pair_key, row["month"]), {"manual": row, "label": label, "images": {}})
+                imported = [
+                    amount for sale_date, amount in item["sales"] if sale_date.startswith(row["month"])
+                ]
+                count, total = pair["images"].get(title, (0, 0.0))
+                pair["images"][title] = (count + len(imported), total + sum(imported))
+        decisions: dict[tuple[str | None, str | None, str], bool] = {}
+        if pairs:
+            st.markdown("**Conflitos com lançamento manual**")
+            st.caption(
+                "O lançamento manual vale para a coleção inteira no mês; se substituído, passa a refletir apenas "
+                "as vendas importadas das imagens (o valor manual anterior fica guardado na nota). Uma escolha por "
+                "coleção e mês vale para todos os arquivos do lote."
+            )
+        for pair_key, pair in pairs.items():
+            manual = pair["manual"]
+            images = "; ".join(
+                f"{title}: {count} venda(s), {total:.2f} USD" for title, (count, total) in pair["images"].items()
+            )
+            with st.container(border=True):
+                st.markdown(
+                    f"**{pair['label']} · {pair_key[2]}** — manual: {manual['downloads']} downloads, "
+                    f"{manual['revenue']:.2f} {manual['currency']}. Importado neste lote: {images}."
+                )
+                decisions[pair_key] = st.radio(
+                    "O que fazer com o lançamento manual?", [False, True],
+                    key=f"adobe_conflict_{pair_key[0]}_{pair_key[1]}_{pair_key[2]}",
+                    format_func=lambda value: "Substituir o manual pelos dados importados" if value else "Manter o manual",
+                )
+        for item in plan:
+            item["replace_months"] = {
+                month for (cid, det, month), replace in decisions.items()
+                if replace and (cid, det) == item["pair_key"]
+            }
+        if problems:
+            st.warning("Importação desativada: " + " ".join(dict.fromkeys(problems)))
+        elif not plan:
+            st.info("Nenhum arquivo importável: corrija os arquivos com erro.")
+        if st.button("Importar", type="primary", disabled=bool(problems) or not plan, key="adobe_import_run"):
+            messages: list[tuple[str, str]] = [("warning", text) for text in skipped]
+            for item in plan:
+                try:
+                    result = database.import_adobe_sales(
+                        item["record_id"], item["sales"], item["name"],
+                        replace_manual=item["replace_months"], new_image=item["new_image"],
+                    )
+                    extra = ""
+                    if result["created"]:
+                        extra += " Imagem criada como aprovada."
+                    elif result["marked_approved"]:
+                        extra += " Imagem marcada como aprovada."
+                    if result["replaced_months"]:
+                        extra += f" Manual substituído em {', '.join(result['replaced_months'])}."
+                    kept = [month for month in result["conflict_months"] if month not in result["replaced_months"]]
+                    if kept:
+                        extra += f" Manual mantido em {', '.join(kept)}."
+                    messages.append((
+                        "success",
+                        f"{item['name']}: {result['new']} venda(s) nova(s), {result['existing']} já existente(s).{extra}",
+                    ))
+                except (ValueError, KeyError, sqlite3.Error) as error:
+                    messages.append(("error", f"{item['name']}: {error}"))
+            st.session_state["adobe_import_messages"] = messages
+            st.session_state["adobe_import_nonce"] = nonce + 1
+            st.rerun()
+    summary = database.list_adobe_sales_summary()
+    if summary:
+        st.markdown("**Vendas importadas por imagem**")
         st.dataframe(
             [
                 {
-                    "coleção": item["name"],
-                    "idade (dias)": item["idade_dias"],
-                    "moeda": item["revenue_currency"] or "-",
-                    "downloads informados": item["downloads"] or 0,
-                    "receita registrada": item["revenue"] or 0,
-                    "candidatos": item["candidates"],
-                    "selecionados": item["selected"],
-                    "geração (s)": item["generation_seconds"] or 0,
-                    "upscale (s)": item["upscale_seconds"] or 0,
-                    "tempo manual (min)": item["manual_minutes"] or 0,
-                    "horas trabalhadas": format_hours(hours_metrics["collections"][item["collection_id"]]["hours"]),
-                    "receita/hora": format_per_hour(
-                        hours_metrics["collections"][item["collection_id"]]["by_currency"]
-                        .get(item["revenue_currency"], {}).get("per_hour"),
-                        item["revenue_currency"] or "",
+                    "imagem": item["title"],
+                    "ID Adobe": item["adobe_id"] or None,
+                    "coleção": (
+                        f"{item['collection_name']} (removida)" if item["detached_from"] and item["collection_name"]
+                        else item["collection_name"] or "Sem coleção"
                     ),
+                    "vendas": item["sales"],
+                    "receita (USD)": round(item["revenue"], 2),
+                    "primeira venda": item["first_sale"],
+                    "última venda": item["last_sale"],
                 }
-                for item in comparisons
+                for item in summary
             ],
-            width="stretch",
-            hide_index=True,
+            width="stretch", hide_index=True,
         )
+        st.caption("Valores do CSV do portal, em USD, sem conversão nem projeção.")
+        with st.expander("Remover vendas importadas de uma imagem"):
+            st.caption(
+                "Desfaz a importação: apaga as vendas importadas da imagem e recalcula os meses. "
+                "O registro de moderação (aprovada, datas, ID) não é alterado."
+            )
+            choice = st.selectbox(
+                "Imagem", [item["record_id"] for item in summary], key="adobe_remove_choice",
+                format_func=lambda value: next(
+                    f"{item['title']} · {item['adobe_id'] or 'sem ID'} · {item['sales']} venda(s)"
+                    for item in summary if item["record_id"] == value
+                ),
+            )
+            confirmed = st.checkbox("Confirmo remover as vendas importadas desta imagem", key=f"adobe_remove_confirm_{choice}")
+            if st.button("Remover vendas importadas desta imagem", disabled=not confirmed, key="adobe_remove"):
+                try:
+                    removed = database.delete_adobe_sales(choice)
+                    st.session_state["adobe_import_messages"] = [("success", f"{removed} venda(s) importada(s) removida(s).")]
+                    st.rerun()
+                except (ValueError, KeyError, sqlite3.Error) as error:
+                    show_error(error)
+
+
+def render_monthly_sales(
+    orchestrator: Orchestrator, collection_id: str | None, sales: list[dict[str, Any]],
+) -> None:
+    database = orchestrator.database
+    st.markdown("#### Downloads e receita mensal")
+    st.caption(
+        "Lance o total do mês conforme o painel da Adobe (um lançamento por coleção e mês). Lançar de "
+        "novo o mesmo mês da mesma coleção substitui o anterior, inclusive a moeda (correção)."
+    )
+    message = st.session_state.pop("monthly_sales_message", None)
+    if message:
+        st.success(message)
+    now = datetime.now(LOCAL_TZ)
+    collections = database.list_collections()
+    names = {item["id"]: item["name"] for item in collections}
+    options = ([collection_id] if collection_id in names else []) + [""] + [
+        cid for cid in names if cid != collection_id
+    ]
+    with st.form("monthly_sales_entry"):
+        columns = st.columns(3)
+        year = columns[0].selectbox("Ano", list(range(now.year, now.year - 6, -1)))
+        month_number = columns[1].selectbox("Mês", list(range(1, 13)), index=now.month - 1, format_func=lambda v: f"{v:02d}")
+        target = columns[2].selectbox(
+            "Coleção", options, format_func=lambda value: "Sem coleção (fora do fluxo)" if not value else names[value],
+        )
+        value_columns = st.columns(3)
+        downloads = value_columns[0].number_input("Downloads", min_value=0, step=1)
+        revenue = value_columns[1].number_input("Receita", min_value=0.0, step=0.1)
+        currency = value_columns[2].selectbox("Moeda", ["USD", "EUR", "BRL", "CAD", "AUD"])
+        notes = st.text_input("Nota ou fonte (opcional)", max_chars=1000)
+        confirm_import = st.checkbox(
+            "Confirmo editar um mês importado (a linha passa a ser manual)", key="monthly_confirm_import",
+        )
+        save = st.form_submit_button("Lançar mês", type="primary")
+    if save:
+        try:
+            database.upsert_monthly_sales(
+                target or None, f"{year}-{month_number:02d}", int(downloads), revenue, currency, notes,
+                confirm_import_override=confirm_import,
+            )
+            st.session_state["monthly_sales_message"] = "Lançamento mensal salvo."
+            st.rerun()
+        except (ValidationError, ValueError, KeyError) as error:
+            show_error(error)
+    if sales:
+        st.dataframe(
+            [
+                {
+                    "mês": item["month"],
+                    "origem": "importado" if item["source"] == "import" else "manual",
+                    "coleção": (
+                        f"{item['collection_name']} (removida)" if item["detached_from"] and item["collection_name"]
+                        else item["collection_name"] or "Sem coleção"
+                    ),
+                    "downloads": item["downloads"],
+                    "receita": item["revenue"],
+                    "moeda": item["currency"],
+                    "nota": item["notes"],
+                }
+                for item in sales
+            ],
+            width="stretch", hide_index=True,
+        )
+        with st.expander("Excluir lançamento mensal"):
+            choice = st.selectbox(
+                "Lançamento", [item["id"] for item in sales], key="monthly_delete_choice",
+                format_func=lambda value: next(
+                    f"{item['month']} · {item['collection_name'] or 'Sem coleção'}"
+                    f"{' (removida)' if item['detached_from'] else ''} · "
+                    f"{item['revenue']:.2f} {item['currency']}"
+                    for item in sales if item["id"] == value
+                ),
+            )
+            st.caption(
+                "Se o mês tiver vendas importadas, a linha importada é recriada a partir delas ao excluir; "
+                "para desfazer uma importação use \"Remover vendas importadas de uma imagem\"."
+            )
+            confirmed = st.checkbox("Confirmo a exclusão deste lançamento", key=f"monthly_delete_confirm_{choice}")
+            if st.button("Excluir lançamento mensal", disabled=not confirmed, key="monthly_delete"):
+                try:
+                    database.delete_monthly_sales(choice)
+                    st.session_state["monthly_sales_message"] = "Lançamento mensal excluído."
+                    st.rerun()
+                except KeyError as error:
+                    show_error(error)
+
+
+def render_performance(orchestrator: Orchestrator, collection_id: str | None) -> None:
+    st.subheader("Resultados e custos informados")
+    st.caption(
+        "Números informados manualmente e conferidos no painel da Adobe; não há conversão de moedas "
+        "nem projeção de ganhos."
+    )
+    database = orchestrator.database
+    comparisons = database.performance_comparison()
+    sales = database.list_monthly_sales()
+    archived = [
+        {**item, "collection_id": None} for item in database.list_archived_work()
+    ]
+    hours_metrics = revenue_per_hour(comparisons, database.work_minutes_by_collection(), sales, archived)
+    render_indicators(database, sales, hours_metrics, archived)
+    render_adobe_import(orchestrator, collection_id)
+    render_monthly_sales(orchestrator, collection_id, sales)
+    with st.expander("Registro avulso (legado)"):
+        st.warning(
+            "A receita lançada aqui também entra na receita/hora, somada aos lançamentos mensais. "
+            "Não registre o mesmo valor nos dois lugares."
+        )
+        if collection_id:
+            concepts = orchestrator.database.list_concepts(collection_id)
+            concept_options = [""] + [concept["id"] for concept in concepts]
+            with st.form("performance_entry"):
+                report_date = st.date_input("Data do relatório", value=date.today())
+                concept_id = st.selectbox(
+                    "Conceito (opcional)", concept_options,
+                    format_func=lambda value: "Coleção inteira" if not value else next(
+                        item["data"]["concept"] for item in concepts if item["id"] == value
+                    ),
+                )
+                downloads = st.number_input("Downloads", min_value=0, step=1)
+                revenue_columns = st.columns(2)
+                revenue = revenue_columns[0].number_input("Receita registrada", min_value=0.0, step=0.1)
+                revenue_currency = revenue_columns[1].selectbox("Moeda da receita", ["USD", "EUR", "BRL", "CAD", "AUD"])
+                moderation = st.selectbox("Resultado de moderação", ["unknown", "pending", "accepted", "rejected"], format_func={
+                    "unknown": "Não informado", "pending": "Pendente", "accepted": "Aceito", "rejected": "Rejeitado"
+                }.get)
+                time_columns = st.columns(3)
+                generation_seconds = time_columns[0].number_input("Geração (segundos)", min_value=0.0, step=1.0)
+                upscale_seconds = time_columns[1].number_input("Upscale (segundos)", min_value=0.0, step=1.0)
+                manual_minutes = time_columns[2].number_input("Tempo manual (minutos)", min_value=0.0, step=1.0)
+                cost_columns = st.columns(2)
+                user_cost = cost_columns[0].number_input("Custo informado", min_value=0.0, step=0.1)
+                cost_currency = cost_columns[1].selectbox("Moeda do custo", ["USD", "EUR", "BRL", "CAD", "AUD"])
+                notes = st.text_area("Nota ou fonte do registro", max_chars=1000)
+                save = st.form_submit_button("Registrar dados", type="primary")
+            if save:
+                try:
+                    entry = PerformanceEntry(
+                        report_date=report_date,
+                        download_count=int(downloads),
+                        revenue=revenue,
+                        revenue_currency=revenue_currency,
+                        moderation_status=moderation,
+                        generation_seconds=generation_seconds,
+                        upscale_seconds=upscale_seconds,
+                        manual_minutes=manual_minutes,
+                        user_cost=user_cost,
+                        cost_currency=cost_currency,
+                        notes=notes,
+                    )
+                    orchestrator.database.record_performance(collection_id, entry, concept_id or None)
+                    st.success("Registro salvo. A comparação usa somente os dados informados.")
+                    st.rerun()
+                except (ValidationError, ValueError) as error:
+                    show_error(error)
+            records = orchestrator.database.list_performance(collection_id)
+            if records:
+                st.markdown("#### Registros desta coleção")
+                st.dataframe(records, width="stretch", hide_index=True)
+        else:
+            st.caption("Selecione uma coleção para usar o registro avulso.")
+
+    if collection_id:
+        render_work_hours(orchestrator, collection_id)
+
+    today = date.today()
+    # Uma linha por coleção e moeda, com a receita das duas fontes (avulso + mensal); moedas que só
+    # existem nos lançamentos mensais ganham linha própria.
+    table_rows: list[dict[str, Any]] = []
+    by_collection: dict[str, list[dict[str, Any]]] = {}
+    for item in comparisons:
+        by_collection.setdefault(item["collection_id"], []).append(item)
+    for cid, items in by_collection.items():
+        metrics = hours_metrics["collections"].get(cid, {"hours": 0.0, "by_currency": {}})
+        currencies = list(metrics["by_currency"])
+        base = items[0]
+        created = datetime.fromisoformat(base["created_at"]).date()
+        for position, currency in enumerate(currencies or [None]):
+            legacy = next((item for item in items if item["revenue_currency"] == currency), None)
+            values = metrics["by_currency"].get(currency, {})
+            table_rows.append({
+                "coleção": base["name"],
+                "idade (dias)": max((today - created).days, 0),
+                "moeda": currency or "-",
+                "receita registrada (avulso + mensal)": values.get("revenue"),
+                "downloads (avulso)": (legacy or {}).get("downloads") or 0,
+                "candidatos": base["candidates"],
+                "selecionados": base["selected"],
+                "geração (s)": (legacy or {}).get("generation_seconds") or 0,
+                "upscale (s)": (legacy or {}).get("upscale_seconds") or 0,
+                "tempo manual (min)": sum(item["manual_minutes"] or 0 for item in items) if position == 0 else 0,
+                "horas trabalhadas": format_hours(metrics["hours"]),
+                "receita/hora": format_per_hour(values.get("per_hour"), currency or ""),
+            })
+    if table_rows:
+        st.markdown("#### Comparação por coleção")
+        st.dataframe(table_rows, width="stretch", hide_index=True)
         total = hours_metrics["total"]
         st.markdown("#### Total geral por moeda")
         if total["by_currency"]:
@@ -2177,6 +2608,7 @@ def render_performance(orchestrator: Orchestrator, collection_id: str | None) ->
             )
         else:
             st.caption(f"Sem receita registrada. Horas totais: {format_hours(total['hours'])}.")
+        st.caption("Receita registrada e receita/hora somam as duas fontes (registro avulso e lançamento mensal) por moeda; downloads, geração e upscale vêm só do registro avulso. O tempo manual aparece uma vez por coleção, na primeira linha.")
         st.caption("Coleções com mais de uma moeda repetem as mesmas horas em cada linha: não some a coluna \"horas trabalhadas\" entre linhas da mesma coleção.")
         st.caption("Horas = lançamentos/cronômetro + tempo manual dos relatórios. Receita/hora = receita da moeda / horas da coleção (ou de todas, no total); sem horas aparece \"-\".")
         st.caption("Receitas em moedas diferentes aparecem em linhas separadas; custos e resultados não são convertidos nem extrapolados.")
@@ -2320,6 +2752,10 @@ def render_moderation(orchestrator: Orchestrator, collection_id: str | None) -> 
             reason = st.text_input("Motivo (obrigatório se rejeitada)")
             adobe_id = st.text_input("ID Adobe")
             submitted_on = st.date_input("Data de envio (opcional)", value=None)
+            decided_on = st.date_input(
+                "Data da decisão (aprovada ou rejeitada; padrão hoje)", value=date.today(),
+                help="Usada nas aprovadas por semana. Ignorada se o resultado for pendente.",
+            )
             notes = st.text_area("Nota")
             add = st.form_submit_button("Registrar", icon=":material/add:")
         if add:
@@ -2327,6 +2763,10 @@ def render_moderation(orchestrator: Orchestrator, collection_id: str | None) -> 
                 database.add_external_moderation(
                     title, result, target or None, reason, adobe_id,
                     submitted_at=submitted_on.isoformat() if submitted_on else None, notes=notes,
+                    decided_at=(
+                        datetime.combine(decided_on, time(12, 0), tzinfo=LOCAL_TZ).astimezone(UTC).isoformat(timespec="seconds")
+                        if decided_on and decided_on != date.today() else None
+                    ),
                 )
                 st.rerun()
             except (ValueError, KeyError) as error:
