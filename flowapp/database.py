@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import uuid
 from datetime import UTC, date, datetime
@@ -8,14 +9,19 @@ from pathlib import Path
 from types import EllipsisType
 from typing import Any, get_args
 
+from flowapp.moderation import local_date, local_noon_utc, today_local
 from flowapp.sales_import import to_micros, with_occurrences
 from flowapp.schemas import (
-    CollectionBrief, ConceptPlan, ModerationStatus, MonthlySalesEntry, PerformanceEntry,
+    LOCAL_TZ, CollectionBrief, ConceptPlan, ModerationStatus, MonthlySalesEntry, PerformanceEntry,
     STATE_TRANSITIONS, WorkflowState,
 )
 
 
 MAX_WORK_MINUTES = 24 * 60
+
+
+EXTERNAL_COLLECTION_NAME = "Sem coleção"
+logger = logging.getLogger(__name__)
 
 
 class InvalidTransition(ValueError):
@@ -108,13 +114,79 @@ def _check_moderation(status: str, reason: str) -> str:
     return reason
 
 
+def _as_date(value: Any, label: str) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    raise ValueError(f"{label} inválida.")
+
+
+def _validate_dates(submitted: str | None, decided: str | None) -> None:
+    """Envio <= decisão <= hoje (datas locais de Madri)."""
+    today = today_local()
+    sent, decision = local_date(submitted), local_date(decided)
+    if sent and sent > today:
+        raise ValueError("A data de envio não pode estar no futuro.")
+    if decision and decision > today:
+        raise ValueError("A data da decisão não pode estar no futuro.")
+    if sent and decision and sent > decision:
+        raise ValueError("A data de envio não pode ser posterior à data da decisão.")
+
+
+def _first_sale(connection: sqlite3.Connection, record_id: str | None) -> str | None:
+    if not record_id:
+        return None
+    return connection.execute(
+        "SELECT MIN(sale_date) AS first FROM adobe_sales WHERE moderation_record_id = ?", (record_id,)
+    ).fetchone()["first"]
+
+
+def _moderation_dates(
+    status: str, existing: sqlite3.Row | dict[str, Any] | None, default_submitted: str | None,
+    timestamp: str, submitted_on: date | None, decided_on: date | None, first_sale: str | None = None,
+) -> tuple[str | None, str | None]:
+    """Datas finais (envio, decisão) de um registro, com a validação envio <= decisão <= hoje.
+
+    Datas informadas são locais de Madri (gravadas ao meio-dia de Madri em UTC). Sem data de envio
+    informada, preserva a existente; só pendente usa hoje. Sem data da decisão, preserva a existente
+    quando o resultado não muda; senão, hoje. A validação só roda quando o usuário informou uma data;
+    a decisão informada também não pode ser posterior à primeira venda importada (`first_sale`).
+    """
+    if submitted_on is not None:
+        submitted_on = _as_date(submitted_on, "Data de envio")
+    if decided_on is not None:
+        decided_on = _as_date(decided_on, "Data da decisão")
+        if status == "pending":
+            raise ValueError("Um registro pendente não tem data da decisão.")
+    existing_submitted = existing["submitted_at"] if existing else None
+    submitted = local_noon_utc(submitted_on) if submitted_on else (existing_submitted or default_submitted)
+    if status == "pending":
+        decided = None
+    elif decided_on:
+        decided = local_noon_utc(decided_on)
+    elif existing and existing["status"] == status and existing["decided_at"]:
+        decided = existing["decided_at"]
+    else:
+        decided = timestamp
+    if submitted_on or decided_on:
+        _validate_dates(submitted, decided)
+        if decided_on and first_sale and decided_on > date.fromisoformat(first_sale):
+            raise ValueError(
+                f"A data da decisão não pode ser posterior à primeira venda importada ({first_sale})."
+            )
+    return submitted, decided
+
+
 def _upsert_moderation(
     connection: sqlite3.Connection, concept_id: str, status: str, reason: str, timestamp: str,
     *, submitted_at: str | None = None, adobe_id: str | None = None, notes: str | None = None,
+    submitted_on: date | None = None, decided_on: date | None = None,
 ) -> None:
     """Cria ou atualiza o registro de moderação de um conceito do fluxo (na transação do chamador).
 
-    Datas já registradas são preservadas quando o resultado não muda.
+    Datas já registradas são preservadas quando o resultado não muda; `submitted_at` é só o valor
+    padrão do envio. `submitted_on`/`decided_on` (datas locais) sobrescrevem, com validação.
     """
     concept = connection.execute(
         "SELECT c.collection_id, c.data_json, col.brief_json FROM concepts c "
@@ -124,8 +196,12 @@ def _upsert_moderation(
         raise KeyError("Conceito não encontrado.")
     reason = _clean_reason(reason)
     existing = connection.execute(
-        "SELECT id, status, decided_at FROM moderation_records WHERE concept_id = ?", (concept_id,)
+        "SELECT id, status, submitted_at, decided_at FROM moderation_records WHERE concept_id = ?", (concept_id,)
     ).fetchone()
+    submitted, decided = _moderation_dates(
+        status, existing, submitted_at, timestamp, submitted_on, decided_on,
+        _first_sale(connection, existing["id"] if existing else None),
+    )
     if existing is None:
         data = json.loads(concept["data_json"])
         connection.execute(
@@ -133,22 +209,16 @@ def _upsert_moderation(
             "adobe_id, submitted_at, decided_at, source, notes, theme, prompt_en, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'flow', ?, ?, ?, ?, ?)",
             (str(uuid.uuid4()), concept["collection_id"], concept_id, data.get("concept", "") or "Sem título",
-             status, reason, adobe_id or "", submitted_at, None if status == "pending" else timestamp,
+             status, reason, adobe_id or "", submitted, decided,
              notes or "", json.loads(concept["brief_json"]).get("theme", ""), data.get("prompt_en", ""),
              timestamp, timestamp),
         )
         return
-    if status == "pending":
-        decided_at = None
-    elif existing["status"] == status and existing["decided_at"]:
-        decided_at = existing["decided_at"]
-    else:
-        decided_at = timestamp
     connection.execute(
         "UPDATE moderation_records SET status = ?, reason = ?, decided_at = ?, "
-        "submitted_at = COALESCE(submitted_at, ?), adobe_id = COALESCE(?, adobe_id), "
+        "submitted_at = ?, adobe_id = COALESCE(?, adobe_id), "
         "notes = COALESCE(?, notes), updated_at = ? WHERE id = ?",
-        (status, reason, decided_at, submitted_at, adobe_id, notes, timestamp, existing["id"]),
+        (status, reason, decided, submitted, adobe_id, notes, timestamp, existing["id"]),
     )
 
 
@@ -262,6 +332,19 @@ class Database:
                 connection.execute(
                     "ALTER TABLE collections ADD COLUMN planning_json TEXT NOT NULL DEFAULT '{}'"
                 )
+            if "kind" not in columns:
+                connection.execute(
+                    "ALTER TABLE collections ADD COLUMN kind TEXT NOT NULL DEFAULT 'normal' "
+                    "CHECK (kind IN ('normal', 'external'))"
+                )
+                # Banco anterior: uma "Sem coleção" criada à mão e ainda sem conceitos vira a coleção
+                # das imagens externas; se tiver conceitos é uma coleção de verdade e fica normal.
+                connection.execute(
+                    "UPDATE collections SET kind = 'external' WHERE id = ("
+                    "SELECT c.id FROM collections c WHERE c.name = ? AND NOT EXISTS "
+                    "(SELECT 1 FROM concepts k WHERE k.collection_id = c.id) ORDER BY c.created_at LIMIT 1)",
+                    (EXTERNAL_COLLECTION_NAME,),
+                )
             asset_columns = {row["name"] for row in connection.execute("PRAGMA table_info(assets)")}
             if "export_json" not in asset_columns:
                 # Registro do JPEG exportado (arquivo, dimensões, avisos); separado dos metadados
@@ -310,6 +393,7 @@ class Database:
                 "COALESCE(collection_id, detached_from, ''), month)"
             )
             self._backfill_moderation(connection)
+            self._migrate_unlinked_to_external(connection)
 
     @staticmethod
     def _backfill_moderation(connection: sqlite3.Connection) -> None:
@@ -357,15 +441,103 @@ class Database:
             result[field.removesuffix("_json")] = json.loads(result.pop(field))
         return result
 
-    def create_collection(self, name: str, brief: CollectionBrief) -> str:
+    def create_collection(self, name: str, brief: CollectionBrief, kind: str = "normal") -> str:
         collection_id = str(uuid.uuid4())
         timestamp = utc_now()
         with self.connect() as connection:
             connection.execute(
-                "INSERT INTO collections(id, name, brief_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                (collection_id, name.strip(), brief.model_dump_json(), timestamp, timestamp),
+                "INSERT INTO collections(id, name, brief_json, kind, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (collection_id, name.strip(), brief.model_dump_json(), kind, timestamp, timestamp),
             )
         return collection_id
+
+    @staticmethod
+    def _ensure_external(connection: sqlite3.Connection) -> str:
+        """Id da coleção externa na transação do chamador; cria se não existir."""
+        row = connection.execute(
+            "SELECT id FROM collections WHERE kind = 'external' ORDER BY created_at LIMIT 1"
+        ).fetchone()
+        if row:
+            return row["id"]
+        name = EXTERNAL_COLLECTION_NAME
+        if connection.execute("SELECT 1 FROM collections WHERE name = ?", (name,)).fetchone():
+            name = f"{EXTERNAL_COLLECTION_NAME} (imagens externas)"  # nome ocupado por uma coleção normal
+        collection_id = str(uuid.uuid4())
+        timestamp = utc_now()
+        brief = CollectionBrief(
+            theme="Imagens enviadas fora do fluxo",
+            objective="Reunir as imagens enviadas à Adobe sem passar pelos agentes do app",
+            concept_count=1,
+        )
+        connection.execute(
+            "INSERT INTO collections(id, name, brief_json, kind, created_at, updated_at) "
+            "VALUES (?, ?, ?, 'external', ?, ?)",
+            (collection_id, name, brief.model_dump_json(), timestamp, timestamp),
+        )
+        return collection_id
+
+    def external_collection_id(self) -> str:
+        """Id da coleção das imagens enviadas fora do fluxo; cria "Sem coleção" se ainda não existir.
+
+        A leitura é sem trava; só quando não existe abre a transação e confere de novo.
+        """
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT id FROM collections WHERE kind = 'external' ORDER BY created_at LIMIT 1"
+            ).fetchone()
+            if row:
+                return row["id"]
+            connection.execute("BEGIN IMMEDIATE")
+            return self._ensure_external(connection)
+
+    def _migrate_unlinked_to_external(self, connection: sqlite3.Connection) -> None:
+        """Move para a coleção externa os registros que nunca tiveram coleção (idempotente).
+
+        São os registros de moderação externos e os lançamentos mensais com collection_id e
+        detached_from NULL. Num mês que já exista na externa, lançamentos manuais da mesma moeda
+        são somados (com nota); moeda diferente, ou linha importada, mantém o lançamento sem
+        vínculo no lugar (aviso no log).
+        """
+        loose_records = connection.execute(
+            "SELECT COUNT(*) AS n FROM moderation_records WHERE concept_id IS NULL "
+            "AND collection_id IS NULL AND detached_from IS NULL"
+        ).fetchone()["n"]
+        loose_sales = connection.execute(
+            "SELECT * FROM monthly_sales WHERE collection_id IS NULL AND detached_from IS NULL "
+            "AND source = 'manual'"
+        ).fetchall()
+        if not loose_records and not loose_sales:
+            return
+        external_id = self._ensure_external(connection)
+        connection.execute(
+            "UPDATE moderation_records SET collection_id = ? WHERE concept_id IS NULL "
+            "AND collection_id IS NULL AND detached_from IS NULL", (external_id,),
+        )
+        for sale in loose_sales:
+            twin = connection.execute(
+                "SELECT id, source, currency, downloads, revenue, notes FROM monthly_sales "
+                "WHERE collection_id = ? AND month = ?", (external_id, sale["month"]),
+            ).fetchone()
+            if twin is None:
+                connection.execute(
+                    "UPDATE monthly_sales SET collection_id = ?, collection_name = '' WHERE id = ?",
+                    (external_id, sale["id"]),
+                )
+            elif twin["source"] == "manual" and twin["currency"] == sale["currency"]:
+                note = f"somado de lançamento sem vínculo: {sale['downloads']} downloads, {sale['revenue']:.2f} {sale['currency']}"
+                connection.execute(
+                    "UPDATE monthly_sales SET downloads = ?, revenue = ?, notes = ?, updated_at = ? WHERE id = ?",
+                    (twin["downloads"] + sale["downloads"], twin["revenue"] + sale["revenue"],
+                     "; ".join(part for part in (twin["notes"], note) if part), utc_now(), twin["id"]),
+                )
+                connection.execute("DELETE FROM monthly_sales WHERE id = ?", (sale["id"],))
+            else:
+                logger.warning(
+                    "Lançamento mensal sem vínculo de %s não foi movido para a coleção externa: "
+                    "já existe lançamento do mesmo mês com outra moeda ou importado.", sale["month"],
+                )
+        self._recalculate_import_sales(connection)
 
     def list_collections(self) -> list[dict[str, Any]]:
         with self.connect() as connection:
@@ -392,6 +564,10 @@ class Database:
             ).fetchone()
             if collection is None:
                 raise KeyError("Coleção não encontrada.")
+            if connection.execute(
+                "SELECT 1 FROM collections WHERE id = ? AND kind = 'external'", (collection_id,)
+            ).fetchone():
+                raise ValueError("A coleção das imagens enviadas fora do fluxo não pode ser removida.")
             active_job = connection.execute(
                 "SELECT id FROM jobs WHERE collection_id = ? "
                 "AND status IN ('queued', 'running') LIMIT 1",
@@ -559,16 +735,23 @@ class Database:
     def set_moderation(
         self, concept_id: str, status: str, reason: str = "",
         adobe_id: str | None = None, notes: str | None = None,
+        submitted_on: date | None = None, decided_on: date | None = None,
     ) -> None:
-        """Registra o resultado da Adobe de um conceito, avançando o estado pela cadeia válida."""
+        """Registra o resultado da Adobe de um conceito, avançando o estado pela cadeia válida.
+
+        `submitted_on`/`decided_on` são datas locais (Madri) opcionais; mudar só a data não muda o estado.
+        """
         reason = _check_moderation(status, reason)
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            self._set_moderation(connection, concept_id, status, reason, adobe_id, notes)
+            self._set_moderation(
+                connection, concept_id, status, reason, adobe_id, notes, submitted_on, decided_on,
+            )
 
     def _set_moderation(
         self, connection: sqlite3.Connection, concept_id: str, status: str, reason: str,
         adobe_id: str | None, notes: str | None,
+        submitted_on: date | None = None, decided_on: date | None = None,
     ) -> None:
         """Corpo de set_moderation; exige uma transação já aberta pelo chamador."""
         target = _STATUS_TO_STATE[status]
@@ -596,8 +779,8 @@ class Database:
             current = step
         _upsert_moderation(
             connection, concept_id, status, reason, timestamp,
-            submitted_at=timestamp if WorkflowState.SUBMITTED in path or status == "pending" else None,
-            adobe_id=adobe_id, notes=notes,
+            submitted_at=timestamp if status == "pending" else None,
+            adobe_id=adobe_id, notes=notes, submitted_on=submitted_on, decided_on=decided_on,
         )
 
     @staticmethod
@@ -634,9 +817,21 @@ class Database:
     def add_external_moderation(
         self, title: str, status: str, collection_id: str | None = None, reason: str = "",
         adobe_id: str = "", submitted_at: str | None = None, decided_at: str | None = None,
-        notes: str = "",
+        notes: str = "", submitted_on: date | None = None, decided_on: date | None = None,
     ) -> str:
-        """Registra uma imagem enviada à Adobe fora do fluxo do app."""
+        """Registra uma imagem enviada à Adobe fora do fluxo do app.
+
+        `submitted_on`/`decided_on` são datas locais (Madri) gravadas ao meio-dia de Madri em UTC e
+        validadas (envio <= decisão <= hoje); `submitted_at`/`decided_at` são timestamps já prontos.
+        """
+        if decided_on is not None and status == "pending":
+            raise ValueError("Um registro pendente não tem data da decisão.")
+        if submitted_on is not None:
+            submitted_at = local_noon_utc(_as_date(submitted_on, "Data de envio"))
+        if decided_on is not None:
+            decided_at = local_noon_utc(_as_date(decided_on, "Data da decisão"))
+        if submitted_on is not None or decided_on is not None:
+            _validate_dates(submitted_at, None if status == "pending" else (decided_at or utc_now()))
         with self.connect() as connection:
             return self._insert_external(
                 connection, title, status, collection_id, reason, adobe_id, submitted_at, decided_at, notes,
@@ -644,31 +839,32 @@ class Database:
 
     def update_moderation_record(
         self, record_id: str, *, status: str, reason: str = "", adobe_id: str = "", notes: str = "",
+        submitted_on: date | None = None, decided_on: date | None = None,
     ) -> None:
         reason = _check_moderation(status, reason)
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             record = connection.execute(
-                "SELECT concept_id, status, decided_at FROM moderation_records WHERE id = ?", (record_id,)
+                "SELECT concept_id, status, submitted_at, decided_at FROM moderation_records WHERE id = ?",
+                (record_id,),
             ).fetchone()
             if record is None:
                 raise KeyError("Registro de moderação não encontrado.")
             if record["concept_id"]:
                 self._set_moderation(
                     connection, record["concept_id"], status, reason, adobe_id.strip(), notes.strip(),
+                    submitted_on, decided_on,
                 )
                 return
             timestamp = utc_now()
-            if status == "pending":
-                decided_at = None
-            else:
-                decided_at = (
-                    record["decided_at"] if record["status"] == status and record["decided_at"] else timestamp
-                )
+            submitted, decided = _moderation_dates(
+                status, record, timestamp if status == "pending" else None, timestamp, submitted_on, decided_on,
+                _first_sale(connection, record_id),
+            )
             connection.execute(
                 "UPDATE moderation_records SET status = ?, reason = ?, adobe_id = ?, notes = ?, "
-                "decided_at = ?, updated_at = ? WHERE id = ?",
-                (status, reason, adobe_id.strip(), notes.strip(), decided_at, timestamp, record_id),
+                "submitted_at = ?, decided_at = ?, updated_at = ? WHERE id = ?",
+                (status, reason, adobe_id.strip(), notes.strip(), submitted, decided, timestamp, record_id),
             )
 
     def list_moderation(self, collection_id: str | None | EllipsisType = ...) -> list[dict[str, Any]]:
@@ -698,7 +894,7 @@ class Database:
         with self.connect() as connection:
             rows = connection.execute(
                 "SELECT c.id AS concept_id, c.data_json, c.state, m.id AS record_id, m.status, "
-                "m.reason, m.adobe_id, m.notes FROM concepts c "
+                "m.reason, m.adobe_id, m.notes, m.submitted_at, m.decided_at FROM concepts c "
                 "LEFT JOIN moderation_records m ON m.concept_id = c.id "
                 f"WHERE c.collection_id = ? AND c.state IN ({','.join('?' * len(states))}) "
                 "ORDER BY c.created_at", (collection_id, *states),
@@ -713,6 +909,8 @@ class Database:
                 "reason": row["reason"] or "",
                 "adobe_id": row["adobe_id"] or "",
                 "notes": row["notes"] or "",
+                "submitted_at": row["submitted_at"],
+                "decided_at": row["decided_at"],
             }
             for row in rows
         ]
@@ -1320,10 +1518,15 @@ class Database:
                 if reused:
                     record_id = reused["id"]
                 else:
+                    submitted = new_image.get("submitted_at")
+                    if new_image.get("submitted_on"):
+                        submitted = local_noon_utc(_as_date(new_image["submitted_on"], "Data de envio"))
+                    decided = f"{first_date}T00:00:00+00:00"
+                    if submitted:
+                        _validate_dates(submitted, decided)
                     record_id = self._insert_external(
                         connection, new_image["title"], "approved", new_image.get("collection_id"), "",
-                        new_image.get("adobe_id") or "", new_image.get("submitted_at"),
-                        f"{first_date}T00:00:00+00:00", "",
+                        new_image.get("adobe_id") or "", submitted, decided, "",
                     )
                     created = True
             record = connection.execute(

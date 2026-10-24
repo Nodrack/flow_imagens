@@ -213,7 +213,7 @@ def test_set_moderation_preserves_dates_when_status_unchanged(env):
     concept_id = _concept(database, collection_id, "Ingrediente", WorkflowState.PREPARED_FOR_TRANSFER)
     database.set_moderation(concept_id, "approved")
     first = _records(database)[0]
-    assert first["submitted_at"] and first["decided_at"]
+    assert first["submitted_at"] is None and first["decided_at"]  # decidir não grava hoje como envio
 
     with database.connect() as connection:
         connection.execute("UPDATE moderation_records SET decided_at = '2026-01-01T00:00:00+00:00'")

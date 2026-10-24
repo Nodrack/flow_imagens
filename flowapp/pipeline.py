@@ -91,6 +91,7 @@ class AgentPipeline:
         collection = self.database.get_collection(collection_id)
         if collection is None:
             raise KeyError("Coleção não encontrada.")
+        self.orchestrator.ensure_normal(collection_id)
         if mode == "regenerate" and not concept_id:
             raise ValueError("Informe o conceito a recriar.")
         params = {
@@ -115,6 +116,13 @@ class AgentPipeline:
         return run_id
 
     def execute(self, run_id: str) -> None:
+        run = self.pipeline.status(run_id, 0)
+        if run is not None:
+            try:
+                self.orchestrator.ensure_normal(run["subject"])
+            except ValueError:
+                self.pipeline.cancel(run_id)  # execução antiga de uma coleção hoje externa: não roda
+                raise
         self.pipeline.execute(run_id)
 
     def cancel(self, run_id: str) -> None:
@@ -127,7 +135,12 @@ class AgentPipeline:
         return self.pipeline.status(run_id, events)
 
     def recover(self) -> int:
-        return self.pipeline.recover()
+        recovered = self.pipeline.recover()
+        for collection in self.database.list_collections():
+            if collection.get("kind") == "external":
+                for run in self.pipeline.runs(collection["id"], limit=20, active_only=True):
+                    self.pipeline.cancel(run["id"])  # nada deve ficar ativo na coleção externa
+        return recovered
 
     # --- Modos ---------------------------------------------------------------
 
