@@ -53,6 +53,8 @@ Ao trocar de motor, a trava de GPU do agentkit pode liberar VRAM, inclusive quan
 9. Aprove localmente a preparação. O app salva JPEG sRGB, JSON auxiliar e manifesto. Ele não chama API de upload, não automatiza login e não atualiza submissão ou moderação sem confirmação humana.
 10. Abra a pasta ou o portal somente pelos botões da aba **Exportação**. Registre transferência manual, submissão e resultado da Adobe em ações distintas.
 
+Na aba **Resultados**, o **Registro da moderação** guarda o resultado da Adobe (pendente, aprovada ou rejeitada, com motivo e ID) de cada imagem. Os conceitos da coleção ativa já preparados para envio podem ser marcados em uma tabela editável (o estado avança até a decisão, com histórico, e a rejeição exige motivo), e imagens enviadas fora do fluxo podem ser registradas à parte. Os botões da aba **Exportação** alimentam o mesmo registro, que é a fonte dos números e dos motivos enviados aos agentes. Ao remover uma coleção, seus registros de moderação são mantidos, sem vínculo, para preservar o aprendizado.
+
 As imagens são guardadas em `data/collections/<id>/` e organizadas em `originals/`, `selected/`, `upscaled/`, `corrections/`, `exports/`, `metadata/` e `workflows/`. Arquivos de origem nunca são sobrescritos. O exportador não redimensiona nem distorce a proporção; limites de MP/tamanho são configuráveis. Não há CSV Adobe porque um esquema oficial aplicável não foi confirmado.
 
 No overview do **Painel**, cada coleção pode ser removida permanentemente depois de digitar seu nome exato. A remoção apaga os registros relacionados no SQLite e apenas `data/collections/<id>/`; é bloqueada enquanto houver jobs ComfyUI em fila ou execução.

@@ -33,8 +33,11 @@ from flowapp.adobe import ADOBE_CATEGORIES, CSV_TITLE_LIMIT, adobe_csv, category
 from flowapp.agents import AgentError, INSTRUCTION_VERSION, adobe_lessons
 from flowapp.comfy import ComfyError
 from flowapp.config import AppConfig, load_config, save_config
-from flowapp.database import Database, DuplicateJobError, InvalidTransition
+from flowapp.database import (
+    APPROVAL_PREFIX, Database, DuplicateJobError, InvalidTransition, REJECTION_PREFIX,
+)
 from flowapp.images import ImageStore, ImageValidationError
+from flowapp.moderation import MODERATION_BY_LABEL, MODERATION_LABELS, moderation_changes
 from flowapp.orchestrator import Orchestrator
 from flowapp.pipeline import (
     AgentPipeline, final_upscale, metadata_approval_targets, metadata_targets, upscale_targets,
@@ -1691,7 +1694,7 @@ def render_transfer_all(orchestrator: Orchestrator, collection_id: str, concepts
         if approve:
             batch_transition(
                 orchestrator, submitted, WorkflowState.ADOBE_APPROVED,
-                f"Aprovação confirmada no portal: {note.strip()}" if note.strip() else "Aprovação confirmada no portal",
+                f"{APPROVAL_PREFIX}: {note.strip()}" if note.strip() else APPROVAL_PREFIX,
             )
 
 
@@ -1823,7 +1826,7 @@ def render_package_status(
         if st.button(
             "Marcar como aprovada", type="primary", icon=":material/verified:", key=f"approve_{concept['id']}",
         ):
-            database.transition_concept(concept["id"], WorkflowState.ADOBE_APPROVED, "Aprovação confirmada no portal")
+            database.transition_concept(concept["id"], WorkflowState.ADOBE_APPROVED, APPROVAL_PREFIX)
             st.rerun()
         with st.form(f"reject_{concept['id']}"):
             reason = st.text_input("Motivo da rejeição pela Adobe")
@@ -1832,7 +1835,7 @@ def render_package_status(
             if not reason.strip():
                 st.error("Informe o motivo da rejeição.")
             else:
-                database.transition_concept(concept["id"], WorkflowState.ADOBE_REJECTED, f"Rejeição confirmada no portal: {reason.strip()}")
+                database.transition_concept(concept["id"], WorkflowState.ADOBE_REJECTED, f"{REJECTION_PREFIX}: {reason.strip()}")
                 st.rerun()
     elif state == WorkflowState.ADOBE_APPROVED:
         st.success("Aprovada pela Adobe.", icon=":material/verified:")
@@ -1940,15 +1943,175 @@ def render_performance(orchestrator: Orchestrator, collection_id: str | None) ->
             hide_index=True,
         )
         st.caption("Receitas em moedas diferentes aparecem em linhas separadas; custos e resultados não são convertidos nem extrapolados.")
+    render_moderation(orchestrator, collection_id)
     render_adobe_learning(orchestrator)
+
+
+def _cell(value: Any) -> str:
+    return "" if value is None or value != value else str(value).strip()
+
+
+def render_moderation_editor(
+    orchestrator: Orchestrator, key: str, rows: list[dict[str, Any]], *, external: bool,
+) -> None:
+    """Tabela editável de moderação; salva só as linhas alteradas, comparadas por id."""
+    import pandas as pd
+
+    database = orchestrator.database
+    for level, text in st.session_state.pop(f"{key}_messages", []):
+        getattr(st, level)(text)
+    name_column = "imagem" if external else "conceito"
+    detail_column = "coleção" if external else "estado no app"
+    table = pd.DataFrame(
+        [
+            {
+                name_column: row["title"],
+                detail_column: (row.get("collection_name") or "Sem coleção") if external else row["state"],
+                "resultado": MODERATION_LABELS[row["status"]],
+                "motivo": row["reason"],
+                "ID Adobe": row["adobe_id"],
+            }
+            for row in rows
+        ],
+        index=pd.Index([row["id"] for row in rows], name="id"),
+    )
+    # A versão na chave descarta as edições pendentes do widget depois de salvar.
+    version = st.session_state.get(f"{key}_version", 0)
+    edited = st.data_editor(
+        table, key=f"{key}_editor_{version}", hide_index=True, width="stretch", num_rows="fixed",
+        disabled=[name_column, detail_column],
+        column_config={
+            "resultado": st.column_config.SelectboxColumn(
+                "resultado", required=True,
+                options=[label for status, label in MODERATION_LABELS.items() if status or not external],
+            ),
+        },
+    )
+    if not st.button("Salvar moderação", key=f"{key}_save", icon=":material/save:"):
+        return
+    by_id = {row["id"]: row for row in rows}
+    changes = moderation_changes(
+        by_id,
+        {
+            row_id: {
+                "status": MODERATION_BY_LABEL[_cell(line["resultado"])],
+                "reason": _cell(line["motivo"]), "adobe_id": _cell(line["ID Adobe"]),
+            }
+            for row_id, line in edited.iterrows()
+        },
+    )
+    if not changes:
+        st.info("Nenhuma alteração para salvar.")
+        return
+    messages: list[tuple[str, str]] = []
+    saved = 0
+    for change in changes:
+        if change["error"]:
+            messages.append(("error", change["error"]))
+        elif change["warning"]:
+            messages.append(("warning", change["warning"]))
+        else:
+            row = by_id[change["id"]]
+            try:
+                if external:
+                    database.update_moderation_record(
+                        row["id"], status=change["status"], reason=change["reason"],
+                        adobe_id=change["adobe_id"], notes=row["notes"],
+                    )
+                else:
+                    database.set_moderation(
+                        row["concept_id"], change["status"], change["reason"], adobe_id=change["adobe_id"],
+                    )
+                saved += 1
+            except (ValueError, KeyError) as error:
+                messages.append(("error", f"{change['title']}: {error}"))
+    if not saved:
+        for level, text in messages:
+            getattr(st, level)(text)
+        return
+    messages.insert(0, ("success", f"{saved} linha(s) salva(s)."))
+    st.session_state[f"{key}_messages"] = messages
+    st.session_state[f"{key}_version"] = version + 1
+    st.rerun()
+
+
+def render_moderation(orchestrator: Orchestrator, collection_id: str | None) -> None:
+    database = orchestrator.database
+    st.markdown("#### Registro da moderação")
+    totals = database.adobe_feedback(limit=0)
+    local = {"approved": 0, "rejected": 0, "pending": 0}
+    if collection_id:
+        for record in database.list_moderation(collection_id):
+            local[record["status"]] += 1
+    columns = st.columns(3)
+    for column, status, label in zip(
+        columns, ("approved", "rejected", "pending"), ("Aprovadas", "Rejeitadas", "Pendentes"),
+    ):
+        column.metric(
+            label, totals[f"{status}_count"],
+            delta=f"{local[status]} na coleção ativa" if collection_id else None, delta_color="off",
+        )
+    if collection_id:
+        candidates = database.moderation_candidates(collection_id)
+        if candidates:
+            st.caption(
+                "Marque o resultado informado pelo portal da Adobe. O estado do conceito avança "
+                "automaticamente até a decisão; a rejeição exige motivo."
+            )
+            for row in candidates:
+                row["id"], row["title"] = row["concept_id"], row["concept"]
+            render_moderation_editor(orchestrator, "moderation_flow", candidates, external=False)
+        else:
+            st.info("Nenhum conceito desta coleção chegou à preparação do pacote ainda.")
+    else:
+        st.caption("Selecione uma coleção na barra lateral para registrar a moderação dos conceitos.")
+
+    collections = database.list_collections()
+    names = {item["id"]: item["name"] for item in collections}
+    with st.expander("Registrar imagem enviada fora do fluxo"):
+        with st.form("moderation_external", clear_on_submit=True):
+            title = st.text_input("Título da imagem")
+            options = [""] + list(names)
+            target = st.selectbox(
+                "Coleção", options, index=options.index(collection_id) if collection_id in options else 0,
+                format_func=lambda value: names.get(value, "Sem coleção"),
+            )
+            result = st.selectbox(
+                "Resultado", ["approved", "rejected", "pending"],
+                format_func=lambda value: MODERATION_LABELS[value],
+            )
+            reason = st.text_input("Motivo (obrigatório se rejeitada)")
+            adobe_id = st.text_input("ID Adobe")
+            submitted_on = st.date_input("Data de envio (opcional)", value=None)
+            notes = st.text_area("Nota")
+            add = st.form_submit_button("Registrar", icon=":material/add:")
+        if add:
+            try:
+                database.add_external_moderation(
+                    title, result, target or None, reason, adobe_id,
+                    submitted_at=submitted_on.isoformat() if submitted_on else None, notes=notes,
+                )
+                st.rerun()
+            except (ValueError, KeyError) as error:
+                show_error(error)
+    # Sem conceito vinculado (externos e registros órfãos de coleções removidas) só se edita aqui.
+    externals = [
+        {**record, "status": record["status"]}
+        for scope in dict.fromkeys([collection_id, None] if collection_id else [None])
+        for record in database.list_moderation(scope) if record["concept_id"] is None
+    ]
+    if externals:
+        st.caption("Imagens sem conceito vinculado (fora do fluxo ou de coleções removidas), da coleção ativa e sem coleção.")
+        render_moderation_editor(orchestrator, "moderation_external_table", externals, external=True)
 
 
 def render_adobe_learning(orchestrator: Orchestrator) -> None:
     st.markdown("#### Aprendizado com a moderação da Adobe")
     feedback = orchestrator.database.adobe_feedback()
     st.caption(
-        f"Aprovadas: {feedback['approved_count']} · Rejeitadas: {feedback['rejected_count']}. "
-        "Os motivos de rejeição de todas as coleções são enviados ao planejador, ao revisor visual "
+        f"Aprovadas: {feedback['approved_count']} · Rejeitadas: {feedback['rejected_count']} · "
+        f"Pendentes: {feedback['pending_count']}. Os números vêm do registro de moderação, que inclui "
+        "imagens enviadas fora do fluxo. Os motivos de rejeição de todas as coleções são enviados ao planejador, ao revisor visual "
         "e ao refinador de prompt; o planejador também recebe exemplos de conceitos aprovados."
     )
     if feedback["rejected"]:

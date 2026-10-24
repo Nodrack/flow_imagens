@@ -5,10 +5,12 @@ import sqlite3
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from types import EllipsisType
+from typing import Any, get_args
 
 from flowapp.schemas import (
-    CollectionBrief, ConceptPlan, PerformanceEntry, STATE_TRANSITIONS, WorkflowState,
+    CollectionBrief, ConceptPlan, ModerationStatus, PerformanceEntry, STATE_TRANSITIONS,
+    WorkflowState,
 )
 
 
@@ -35,6 +37,87 @@ def _merge_review(review_json: str, decision: str, reason: str) -> str:
     review.update({"human_decision": decision, "reason": reason.strip()})
     return json.dumps(review, ensure_ascii=False)
 
+
+APPROVAL_PREFIX = "Aprovação confirmada no portal"
+REJECTION_PREFIX = "Rejeição confirmada no portal"
+MODERATION_PREFIXES = (f"{REJECTION_PREFIX}:", "Registrado na tela de moderação:")
+MODERATION_NOTE = "Registrado na tela de moderação"
+_STATE_TO_STATUS = {
+    WorkflowState.SUBMITTED.value: "pending",
+    WorkflowState.ADOBE_APPROVED.value: "approved",
+    WorkflowState.ADOBE_REJECTED.value: "rejected",
+}
+_STATUS_TO_STATE = {
+    "pending": WorkflowState.SUBMITTED,
+    "approved": WorkflowState.ADOBE_APPROVED,
+    "rejected": WorkflowState.ADOBE_REJECTED,
+}
+# Cadeia válida até a moderação; a partir de submitted/adobe_* a correção é direta.
+_MODERATION_CHAIN = (
+    WorkflowState.PREPARED_FOR_TRANSFER, WorkflowState.TRANSFERRED, WorkflowState.SUBMITTED,
+)
+
+
+def _clean_reason(reason: str) -> str:
+    """Remove o prefixo gravado nas transições, deixando só o motivo do portal."""
+    text = (reason or "").strip()
+    for prefix in MODERATION_PREFIXES:
+        if text.startswith(prefix):
+            return text[len(prefix):].strip()
+    return text
+
+
+def _check_moderation(status: str, reason: str) -> str:
+    if status not in get_args(ModerationStatus):
+        raise ValueError("Resultado de moderação inválido.")
+    reason = _clean_reason(reason)
+    if status == "rejected" and not reason:
+        raise ValueError("Informe o motivo da rejeição.")
+    return reason
+
+
+def _upsert_moderation(
+    connection: sqlite3.Connection, concept_id: str, status: str, reason: str, timestamp: str,
+    *, submitted_at: str | None = None, adobe_id: str | None = None, notes: str | None = None,
+) -> None:
+    """Cria ou atualiza o registro de moderação de um conceito do fluxo (na transação do chamador).
+
+    Datas já registradas são preservadas quando o resultado não muda.
+    """
+    concept = connection.execute(
+        "SELECT c.collection_id, c.data_json, col.brief_json FROM concepts c "
+        "JOIN collections col ON col.id = c.collection_id WHERE c.id = ?", (concept_id,)
+    ).fetchone()
+    if concept is None:
+        raise KeyError("Conceito não encontrado.")
+    reason = _clean_reason(reason)
+    existing = connection.execute(
+        "SELECT id, status, decided_at FROM moderation_records WHERE concept_id = ?", (concept_id,)
+    ).fetchone()
+    if existing is None:
+        data = json.loads(concept["data_json"])
+        connection.execute(
+            "INSERT INTO moderation_records(id, collection_id, concept_id, title, status, reason, "
+            "adobe_id, submitted_at, decided_at, source, notes, theme, prompt_en, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'flow', ?, ?, ?, ?, ?)",
+            (str(uuid.uuid4()), concept["collection_id"], concept_id, data.get("concept", "") or "Sem título",
+             status, reason, adobe_id or "", submitted_at, None if status == "pending" else timestamp,
+             notes or "", json.loads(concept["brief_json"]).get("theme", ""), data.get("prompt_en", ""),
+             timestamp, timestamp),
+        )
+        return
+    if status == "pending":
+        decided_at = None
+    elif existing["status"] == status and existing["decided_at"]:
+        decided_at = existing["decided_at"]
+    else:
+        decided_at = timestamp
+    connection.execute(
+        "UPDATE moderation_records SET status = ?, reason = ?, decided_at = ?, "
+        "submitted_at = COALESCE(submitted_at, ?), adobe_id = COALESCE(?, adobe_id), "
+        "notes = COALESCE(?, notes), updated_at = ? WHERE id = ?",
+        (status, reason, decided_at, submitted_at, adobe_id, notes, timestamp, existing["id"]),
+    )
 
 
 class Database:
@@ -101,6 +184,20 @@ class Database:
                     manual_minutes REAL NOT NULL, user_cost REAL NOT NULL,
                     cost_currency TEXT NOT NULL, notes TEXT NOT NULL, created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS moderation_records (
+                    id TEXT PRIMARY KEY,
+                    collection_id TEXT REFERENCES collections(id),
+                    concept_id TEXT UNIQUE REFERENCES concepts(id),
+                    title TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected')),
+                    reason TEXT NOT NULL DEFAULT '', adobe_id TEXT NOT NULL DEFAULT '',
+                    submitted_at TEXT, decided_at TEXT,
+                    source TEXT NOT NULL CHECK (source IN ('flow', 'external')),
+                    notes TEXT NOT NULL DEFAULT '',
+                    theme TEXT NOT NULL DEFAULT '', prompt_en TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS ix_moderation_collection ON moderation_records(collection_id);
                 CREATE INDEX IF NOT EXISTS ix_concepts_collection ON concepts(collection_id, created_at);
                 CREATE INDEX IF NOT EXISTS ix_assets_concept ON assets(concept_id, created_at);
                 CREATE INDEX IF NOT EXISTS ix_jobs_status ON jobs(status, created_at);
@@ -118,6 +215,53 @@ class Database:
                 connection.execute(
                     "ALTER TABLE assets ADD COLUMN export_json TEXT NOT NULL DEFAULT '{}'"
                 )
+            moderation_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(moderation_records)")
+            }
+            for column in ("theme", "prompt_en"):
+                # Cópia do tema e do prompt para o registro sobreviver à remoção da coleção.
+                if column not in moderation_columns:
+                    connection.execute(
+                        f"ALTER TABLE moderation_records ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+                    )
+            self._backfill_moderation(connection)
+
+    @staticmethod
+    def _backfill_moderation(connection: sqlite3.Connection) -> None:
+        """Cria o registro dos conceitos já enviados antes da tabela existir (idempotente)."""
+        legacy = connection.execute(
+            "SELECT c.id, c.collection_id, c.data_json, c.state, c.updated_at, col.brief_json "
+            "FROM concepts c JOIN collections col ON col.id = c.collection_id "
+            "WHERE c.state IN (?, ?, ?) AND NOT EXISTS "
+            "(SELECT 1 FROM moderation_records m WHERE m.concept_id = c.id)",
+            tuple(_STATE_TO_STATUS),
+        ).fetchall()
+        for concept in legacy:
+            status = _STATE_TO_STATUS[concept["state"]]
+
+            def last(state: WorkflowState) -> sqlite3.Row | None:
+                return connection.execute(
+                    "SELECT reason, created_at FROM transitions WHERE concept_id = ? AND to_state = ? "
+                    "ORDER BY id DESC LIMIT 1", (concept["id"], state.value),
+                ).fetchone()
+
+            submitted = last(WorkflowState.SUBMITTED)
+            decision = last(_STATUS_TO_STATE[status]) if status != "pending" else None
+            reason = _clean_reason(decision["reason"]) if decision and status == "rejected" else ""
+            reference = decision or submitted
+            created = reference["created_at"] if reference else concept["updated_at"]
+            data = json.loads(concept["data_json"])
+            connection.execute(
+                "INSERT OR IGNORE INTO moderation_records(id, collection_id, concept_id, title, status, "
+                "reason, submitted_at, decided_at, source, theme, prompt_en, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'flow', ?, ?, ?, ?)",
+                (str(uuid.uuid4()), concept["collection_id"], concept["id"],
+                 data.get("concept", "") or "Sem título", status, reason,
+                 submitted["created_at"] if submitted else None,
+                 decision["created_at"] if decision else None,
+                 json.loads(concept["brief_json"]).get("theme", ""), data.get("prompt_en", ""),
+                 created, created),
+            )
 
     @staticmethod
     def _decode(row: sqlite3.Row | None, json_fields: tuple[str, ...] = ()) -> dict[str, Any] | None:
@@ -195,6 +339,11 @@ class Database:
                 "(SELECT id FROM concepts WHERE collection_id = ?)",
                 (collection_id,),
             )
+            # O histórico de moderação é preservado (sem vínculo) para continuar alimentando os agentes.
+            connection.execute(
+                "UPDATE moderation_records SET concept_id = NULL, collection_id = NULL "
+                "WHERE collection_id = ?", (collection_id,),
+            )
             connection.execute("DELETE FROM assets WHERE collection_id = ?", (collection_id,))
             connection.execute("DELETE FROM concepts WHERE collection_id = ?", (collection_id,))
             connection.execute("DELETE FROM collections WHERE id = ?", (collection_id,))
@@ -260,6 +409,8 @@ class Database:
             )
 
     def transition_concept(self, concept_id: str, target: WorkflowState, reason: str) -> None:
+        if target == WorkflowState.ADOBE_REJECTED:
+            _check_moderation("rejected", reason)
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute("SELECT state FROM concepts WHERE id = ?", (concept_id,)).fetchone()
@@ -269,15 +420,31 @@ class Database:
             if target not in STATE_TRANSITIONS[current]:
                 raise InvalidTransition(f"Transição não permitida: {current.value} -> {target.value}.")
             timestamp = utc_now()
-            connection.execute(
-                "UPDATE concepts SET state = ?, updated_at = ? WHERE id = ?",
-                (target.value, timestamp, concept_id),
-            )
-            connection.execute(
-                "INSERT INTO transitions(concept_id, from_state, to_state, reason, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (concept_id, current.value, target.value, reason.strip(), timestamp),
-            )
+            self._move(connection, concept_id, current, target, reason, timestamp)
+            if target.value in _STATE_TO_STATUS:
+                status = _STATE_TO_STATUS[target.value]
+                note = None
+                if status == "approved" and reason.startswith(APPROVAL_PREFIX):
+                    note = reason[len(APPROVAL_PREFIX):].lstrip(":").strip() or None
+                _upsert_moderation(
+                    connection, concept_id, status, reason if status == "rejected" else "", timestamp,
+                    submitted_at=timestamp if status == "pending" else None, notes=note,
+                )
+
+    @staticmethod
+    def _move(
+        connection: sqlite3.Connection, concept_id: str, current: WorkflowState,
+        target: WorkflowState, reason: str, timestamp: str,
+    ) -> None:
+        connection.execute(
+            "UPDATE concepts SET state = ?, updated_at = ? WHERE id = ?",
+            (target.value, timestamp, concept_id),
+        )
+        connection.execute(
+            "INSERT INTO transitions(concept_id, from_state, to_state, reason, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (concept_id, current.value, target.value, reason.strip(), timestamp),
+        )
 
     def transition_history(self, concept_id: str) -> list[dict[str, Any]]:
         with self.connect() as connection:
@@ -287,47 +454,195 @@ class Database:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def set_moderation(
+        self, concept_id: str, status: str, reason: str = "",
+        adobe_id: str | None = None, notes: str | None = None,
+    ) -> None:
+        """Registra o resultado da Adobe de um conceito, avançando o estado pela cadeia válida."""
+        reason = _check_moderation(status, reason)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._set_moderation(connection, concept_id, status, reason, adobe_id, notes)
+
+    def _set_moderation(
+        self, connection: sqlite3.Connection, concept_id: str, status: str, reason: str,
+        adobe_id: str | None, notes: str | None,
+    ) -> None:
+        """Corpo de set_moderation; exige uma transação já aberta pelo chamador."""
+        target = _STATUS_TO_STATE[status]
+        allowed = {*_MODERATION_CHAIN, WorkflowState.ADOBE_APPROVED, WorkflowState.ADOBE_REJECTED}
+        row = connection.execute("SELECT state FROM concepts WHERE id = ?", (concept_id,)).fetchone()
+        if row is None:
+            raise KeyError("Conceito não encontrado.")
+        current = WorkflowState(row["state"])
+        if current not in allowed:
+            raise InvalidTransition(
+                f"A moderação só pode ser registrada após a preparação do pacote (estado atual: {current.value})."
+            )
+        if current in _MODERATION_CHAIN:
+            path = list(_MODERATION_CHAIN[_MODERATION_CHAIN.index(current) + 1:])
+            if target != WorkflowState.SUBMITTED:
+                path.append(target)
+        else:
+            path = [target] if target != current else []
+        timestamp = utc_now()
+        for step in path:
+            if step not in STATE_TRANSITIONS[current]:
+                raise InvalidTransition(f"Transição não permitida: {current.value} -> {step.value}.")
+            step_reason = MODERATION_NOTE + (f": {reason}" if step == WorkflowState.ADOBE_REJECTED else "")
+            self._move(connection, concept_id, current, step, step_reason, timestamp)
+            current = step
+        _upsert_moderation(
+            connection, concept_id, status, reason, timestamp,
+            submitted_at=timestamp if WorkflowState.SUBMITTED in path or status == "pending" else None,
+            adobe_id=adobe_id, notes=notes,
+        )
+
+    def add_external_moderation(
+        self, title: str, status: str, collection_id: str | None = None, reason: str = "",
+        adobe_id: str = "", submitted_at: str | None = None, decided_at: str | None = None,
+        notes: str = "",
+    ) -> str:
+        """Registra uma imagem enviada à Adobe fora do fluxo do app."""
+        title = title.strip()
+        if not title:
+            raise ValueError("Informe o título da imagem.")
+        reason = _check_moderation(status, reason)
+        record_id = str(uuid.uuid4())
+        timestamp = utc_now()
+        with self.connect() as connection:
+            if collection_id is not None and connection.execute(
+                "SELECT 1 FROM collections WHERE id = ?", (collection_id,)
+            ).fetchone() is None:
+                raise KeyError("Coleção não encontrada.")
+            theme = ""
+            if collection_id is not None:
+                theme = json.loads(connection.execute(
+                    "SELECT brief_json FROM collections WHERE id = ?", (collection_id,)
+                ).fetchone()["brief_json"]).get("theme", "")
+            connection.execute(
+                "INSERT INTO moderation_records(id, collection_id, concept_id, title, status, reason, "
+                "adobe_id, submitted_at, decided_at, source, notes, theme, created_at, updated_at) "
+                "VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, 'external', ?, ?, ?, ?)",
+                (record_id, collection_id, title, status, reason, adobe_id.strip(), submitted_at,
+                 None if status == "pending" else (decided_at or timestamp),
+                 notes.strip(), theme, timestamp, timestamp),
+            )
+        return record_id
+
+    def update_moderation_record(
+        self, record_id: str, *, status: str, reason: str = "", adobe_id: str = "", notes: str = "",
+    ) -> None:
+        reason = _check_moderation(status, reason)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            record = connection.execute(
+                "SELECT concept_id, status, decided_at FROM moderation_records WHERE id = ?", (record_id,)
+            ).fetchone()
+            if record is None:
+                raise KeyError("Registro de moderação não encontrado.")
+            if record["concept_id"]:
+                self._set_moderation(
+                    connection, record["concept_id"], status, reason, adobe_id.strip(), notes.strip(),
+                )
+                return
+            timestamp = utc_now()
+            if status == "pending":
+                decided_at = None
+            else:
+                decided_at = (
+                    record["decided_at"] if record["status"] == status and record["decided_at"] else timestamp
+                )
+            connection.execute(
+                "UPDATE moderation_records SET status = ?, reason = ?, adobe_id = ?, notes = ?, "
+                "decided_at = ?, updated_at = ? WHERE id = ?",
+                (status, reason, adobe_id.strip(), notes.strip(), decided_at, timestamp, record_id),
+            )
+
+    def list_moderation(self, collection_id: str | None | EllipsisType = ...) -> list[dict[str, Any]]:
+        """Registros de uma coleção (None = sem coleção); sem argumento, todos."""
+        query = (
+            "SELECT m.*, col.name AS collection_name FROM moderation_records m "
+            "LEFT JOIN collections col ON col.id = m.collection_id"
+        )
+        params: tuple[Any, ...] = ()
+        if collection_id is None:
+            query += " WHERE m.collection_id IS NULL"
+        elif collection_id is not ...:
+            query += " WHERE m.collection_id = ?"
+            params = (collection_id,)
+        with self.connect() as connection:
+            rows = connection.execute(
+                query + " ORDER BY COALESCE(m.decided_at, m.updated_at) DESC, m.created_at DESC", params
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def moderation_candidates(self, collection_id: str) -> list[dict[str, Any]]:
+        """Conceitos da coleção já preparados/enviados, com o resultado registrado (None = não enviada)."""
+        states = (
+            WorkflowState.PREPARED_FOR_TRANSFER.value, WorkflowState.TRANSFERRED.value,
+            *_STATE_TO_STATUS,
+        )
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT c.id AS concept_id, c.data_json, c.state, m.id AS record_id, m.status, "
+                "m.reason, m.adobe_id, m.notes FROM concepts c "
+                "LEFT JOIN moderation_records m ON m.concept_id = c.id "
+                f"WHERE c.collection_id = ? AND c.state IN ({','.join('?' * len(states))}) "
+                "ORDER BY c.created_at", (collection_id, *states),
+            ).fetchall()
+        return [
+            {
+                "concept_id": row["concept_id"],
+                "record_id": row["record_id"],
+                "concept": json.loads(row["data_json"]).get("concept", ""),
+                "state": row["state"],
+                "status": row["status"] or _STATE_TO_STATUS.get(row["state"]),
+                "reason": row["reason"] or "",
+                "adobe_id": row["adobe_id"] or "",
+                "notes": row["notes"] or "",
+            }
+            for row in rows
+        ]
+
     def adobe_feedback(self, limit: int = 20) -> dict[str, Any]:
         """Resultados da moderação da Adobe em todas as coleções, para os agentes aprenderem."""
+        query = (
+            "SELECT m.title, m.reason, m.decided_at, m.updated_at, m.collection_id, "
+            "m.theme AS snapshot_theme, m.prompt_en AS snapshot_prompt, "
+            "c.data_json, col.brief_json FROM moderation_records m "
+            "LEFT JOIN concepts c ON c.id = m.concept_id "
+            "LEFT JOIN collections col ON col.id = m.collection_id "
+            "WHERE m.status = ? ORDER BY COALESCE(m.decided_at, m.updated_at) DESC LIMIT ?"
+        )
         with self.connect() as connection:
-            rejected = connection.execute(
-                "SELECT t.reason, t.created_at, c.collection_id, c.data_json, col.brief_json "
-                "FROM transitions t JOIN concepts c ON c.id = t.concept_id "
-                "JOIN collections col ON col.id = c.collection_id "
-                "WHERE t.to_state = ? ORDER BY t.id DESC LIMIT ?",
-                (WorkflowState.ADOBE_REJECTED.value, limit),
-            ).fetchall()
-            approved = connection.execute(
-                "SELECT c.collection_id, c.data_json, col.brief_json FROM concepts c "
-                "JOIN collections col ON col.id = c.collection_id "
-                "WHERE c.state = ? ORDER BY c.updated_at DESC LIMIT ?",
-                (WorkflowState.ADOBE_APPROVED.value, limit),
-            ).fetchall()
+            rejected = connection.execute(query, ("rejected", limit)).fetchall()
+            approved = connection.execute(query, ("approved", limit)).fetchall()
             counts = {
-                row["state"]: row["total"] for row in connection.execute(
-                    "SELECT state, COUNT(*) AS total FROM concepts WHERE state IN (?, ?) GROUP BY state",
-                    (WorkflowState.ADOBE_APPROVED.value, WorkflowState.ADOBE_REJECTED.value),
+                row["status"]: row["total"] for row in connection.execute(
+                    "SELECT status, COUNT(*) AS total FROM moderation_records GROUP BY status"
                 )
             }
 
         def entry(row: sqlite3.Row) -> dict[str, Any]:
-            data = json.loads(row["data_json"])
+            data = json.loads(row["data_json"]) if row["data_json"] else {}
+            brief = json.loads(row["brief_json"]) if row["brief_json"] else {}
             return {
                 "collection_id": row["collection_id"],
-                "theme": json.loads(row["brief_json"]).get("theme", ""),
-                "concept": data.get("concept", ""),
-                "prompt_en": data.get("prompt_en", ""),
+                "theme": brief.get("theme", "") or row["snapshot_theme"],
+                "concept": row["title"],
+                "prompt_en": data.get("prompt_en", "") or row["snapshot_prompt"],
             }
 
         return {
-            # O motivo é gravado como "Rejeição confirmada no portal: <motivo>".
             "rejected": [
-                {**entry(row), "reason": row["reason"].split(":", 1)[-1].strip(), "created_at": row["created_at"]}
+                {**entry(row), "reason": row["reason"], "created_at": row["decided_at"] or row["updated_at"]}
                 for row in rejected
             ],
             "approved": [entry(row) for row in approved],
-            "rejected_count": counts.get(WorkflowState.ADOBE_REJECTED.value, 0),
-            "approved_count": counts.get(WorkflowState.ADOBE_APPROVED.value, 0),
+            "rejected_count": counts.get("rejected", 0),
+            "approved_count": counts.get("approved", 0),
+            "pending_count": counts.get("pending", 0),
         }
 
     def create_job(

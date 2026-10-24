@@ -74,9 +74,13 @@ STATE_TRANSITIONS: dict[WorkflowState, set[WorkflowState]] = {
         WorkflowState.DRAFT, WorkflowState.PROMPTS_APPROVED,
         WorkflowState.CANDIDATES_READY, WorkflowState.SELECTED,
     },
-    WorkflowState.ADOBE_APPROVED: set(),
-    WorkflowState.ADOBE_REJECTED: set(),
+    # SUBMITTED representa "pendente": permite corrigir uma decisão registrada por engano.
+    WorkflowState.ADOBE_APPROVED: {WorkflowState.ADOBE_REJECTED, WorkflowState.SUBMITTED},
+    WorkflowState.ADOBE_REJECTED: {WorkflowState.ADOBE_APPROVED, WorkflowState.SUBMITTED},
 }
+
+ModerationStatus = Literal["pending", "approved", "rejected"]
+ModerationSource = Literal["flow", "external"]
 
 
 class CollectionBrief(BaseModel):
