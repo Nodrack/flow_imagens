@@ -11,6 +11,7 @@ from PIL import Image, ImageCms, ImageOps, UnidentifiedImageError
 from flowapp.adobe import build_iptc_app13, build_xmp, category_number, insert_app13
 from flowapp.database import Database, utc_now
 from flowapp.schemas import ExportRules
+from flowapp.quality import QualityRules, inspect_image
 
 
 class ImageValidationError(ValueError):
@@ -115,6 +116,9 @@ class ImageStore:
         title: str,
         keywords: list[str],
         rules: ExportRules,
+        quality_rules: QualityRules | None = None,
+        allow_warnings: bool = False,
+        preview: bool = False,
     ) -> tuple[Path, dict[str, Any]]:
         source_path = Path(asset["path"])
         if not source_path.is_file():
@@ -158,6 +162,20 @@ class ImageStore:
         content = insert_app13(output.getvalue(), build_iptc_app13(title, keywords))
         if rules.max_file_bytes is not None and len(content) > rules.max_file_bytes:
             warnings.append(f"Arquivo excede o limite configurado ({rules.max_file_bytes} bytes).")
+        technical = inspect_image(content, quality_rules or QualityRules(), rules)
+        # Check the encoded JPEG as well; metadata contributes to its actual size.
+        if rules.max_file_bytes is not None and len(content) > rules.max_file_bytes:
+            technical["status"] = "blocked"
+            technical["reasons"].append("JPEG excede o tamanho máximo configurado.")
+        technical["metrics"]["jpeg_size_bytes"] = len(content)
+        warnings.extend(technical["reasons"])
+        if preview:
+            return source_path, {"technical": technical, "warnings": warnings}
+        if quality_rules is not None:
+            if technical["status"] == "blocked":
+                raise ImageValidationError("Exportação bloqueada: " + " ".join(technical["reasons"]))
+            if warnings and not allow_warnings:
+                raise ImageValidationError("Confirme os alertas antes de exportar: " + " ".join(warnings))
         digest = hashlib.sha256(content).hexdigest()
         root = self.collection_path(asset["collection_id"])
         exports = root / "exports"
@@ -177,6 +195,7 @@ class ImageStore:
             "size_bytes": len(content),
             "sha256": digest,
             "warnings": warnings,
+            "technical": technical,
             "title": title,
             "keywords": keywords,
             "category_suggestion": metadata.get("category_suggestion", ""),
