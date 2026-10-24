@@ -54,5 +54,91 @@
     "one_per_concept": true,
     "thumbnail_size": 64,
     "palette_bins": 8
+  },
+  "seasonal_calendar": {
+    "enabled": true,
+    "horizon_days": 180,
+    "events": [
+      {
+        "name": "Ano Novo",
+        "enabled": true,
+        "rule": "fixed",
+        "month": 1,
+        "day": 1,
+        "on_date": null,
+        "lead_days": 90,
+        "notes": ""
+      },
+      {
+        "name": "Carnaval",
+        "enabled": true,
+        "rule": "carnival",
+        "month": 1,
+        "day": 1,
+        "on_date": null,
+        "lead_days": 90,
+        "notes": "Terça-feira; adapte ao mercado da campanha."
+      },
+      {
+        "name": "Páscoa",
+        "enabled": true,
+        "rule": "easter",
+        "month": 1,
+        "day": 1,
+        "on_date": null,
+        "lead_days": 90,
+        "notes": ""
+      },
+      {
+        "name": "Dia das Mães",
+        "enabled": true,
+        "rule": "mothers_day",
+        "month": 1,
+        "day": 1,
+        "on_date": null,
+        "lead_days": 90,
+        "notes": "2º domingo de maio. A data varia por país."
+      },
+      {
+        "name": "Verão — campanha no hemisfério norte",
+        "enabled": true,
+        "rule": "fixed",
+        "month": 6,
+        "day": 21,
+        "on_date": null,
+        "lead_days": 90,
+        "notes": "Marco comercial configurável, não previsão do solstício."
+      },
+      {
+        "name": "Black Friday",
+        "enabled": true,
+        "rule": "black_friday",
+        "month": 1,
+        "day": 1,
+        "on_date": null,
+        "lead_days": 90,
+        "notes": ""
+      },
+      {
+        "name": "Natal",
+        "enabled": true,
+        "rule": "fixed",
+        "month": 12,
+        "day": 25,
+        "on_date": null,
+        "lead_days": 90,
+        "notes": ""
+      },
+      {
+        "name": "Verão — campanha no hemisfério sul",
+        "enabled": false,
+        "rule": "fixed",
+        "month": 12,
+        "day": 21,
+        "on_date": null,
+        "lead_days": 90,
+        "notes": "Marco comercial configurável, não previsão do solstício."
+      }
+    ]
   }
 }

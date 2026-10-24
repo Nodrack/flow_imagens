@@ -42,9 +42,9 @@ class FakeLMStudio:
         self.recommendations = list(recommendations or [])
         self.counter = 0
 
-    def plan_collection(self, model, brief, attempts, progress, *, count, avoid, style_guide, hint, lessons=""):
+    def plan_collection(self, model, brief, attempts, progress, *, count, avoid, style_guide, hint, lessons="", seasonal=""):
         self.plan_calls.append({
-            "count": count, "avoid": list(avoid), "style": style_guide, "hint": hint, "lessons": lessons,
+            "count": count, "avoid": list(avoid), "style": style_guide, "hint": hint, "lessons": lessons, "seasonal": seasonal,
         })
         progress("planejando")
         concepts = []
@@ -350,7 +350,7 @@ def test_planner_requests_exact_batch_and_enforces_brief_orientation():
     client = _mock_lmstudio(respond)
     brief = CollectionBrief(theme="Tema", objective="Objetivo", orientation="vertical", concept_count=9)
     output, _, _ = client.plan_collection(
-        "m", brief, count=2, avoid=["Conceito antigo"], style_guide="Luz suave", hint="noite",
+        "m", brief, count=2, avoid=["Conceito antigo"], style_guide="Luz suave", hint="noite", seasonal="CONTEXTO SAZONAL DE TESTE",
     )
     client.close()
 
@@ -358,6 +358,7 @@ def test_planner_requests_exact_batch_and_enforces_brief_orientation():
     assert "exatamente 2 conceito" in sent[0]
     assert "Conceito antigo" in sent[0] and "Luz suave" in sent[0] and "noite" in sent[0]
     assert '"concept_count"' not in sent[0]
+    assert 'CONTEXTO SAZONAL DE TESTE' in sent[0]
 
 
 def test_upscale_all_processes_only_selected_concepts_and_continues_after_failure(pipeline_env):
@@ -447,3 +448,28 @@ def test_metadata_all_uses_vision_on_approved_upscales_only(pipeline_env):
     assert not database.get_asset(upscales[concepts[2]["id"]])["metadata"]
     agent = next(item for item in run["agents"] if item["agent"] == "metadata")
     assert agent["state"] == "done" and "1 falha" in agent["message"]
+
+
+
+@pytest.mark.parametrize('enabled', [True, False])
+def test_pipeline_supplies_seasonal_context_to_every_planner_batch(pipeline_env, monkeypatch, enabled):
+    from datetime import date
+    from flowapp.seasonal import SeasonalCalendar, SeasonalEvent
+    tmp_path, orchestrator, pipeline, fake_lm, _, profile = pipeline_env
+    monkeypatch.setattr('flowapp.seasonal.today_local', lambda: date(2026, 10, 24))
+    orchestrator.config.seasonal_calendar = SeasonalCalendar(enabled=enabled, events=[
+        SeasonalEvent(name='Campanha futura', rule='once', on_date=date(2027, 2, 9), lead_days=90),
+        SeasonalEvent(name='Prazo perdido', rule='once', on_date=date(2026, 12, 25), lead_days=90),
+    ])
+    save_default_profile(tmp_path / 'data', profile)
+    collection = _collection(orchestrator, count=6)
+    run_id = pipeline.create(collection, 'full', 'text-model', '')
+    pipeline.execute(run_id)
+    assert pipeline.status(run_id)['status'] == 'completed'
+    assert len(fake_lm.plan_calls) == 2
+    for call in fake_lm.plan_calls:
+        assert 'Prazo perdido' not in call['seasonal']
+        if enabled:
+            assert 'Campanha futura' in call['seasonal'] and '2026-11-11' in call['seasonal']
+        else:
+            assert call['seasonal'] == ''

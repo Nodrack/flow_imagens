@@ -56,9 +56,9 @@ Validação local em 24/10/2026: os dois pares do aceite recebem alerta de palet
 ## P1. Temas e produção
 
 ### 6. Calendário sazonal
-- [ ] Lista configurável de datas (Ano Novo, Carnaval, Páscoa, Dia das Mães, verão, Black Friday, Natal etc.) com antecedência de envio recomendada.
-- [ ] O Painel mostra as próximas datas-limite de envio.
-- [ ] O planejador recebe as datas próximas ao sugerir conceitos.
+- [x] Lista configurável de datas (Ano Novo, Carnaval, Páscoa, Dia das Mães, verão, Black Friday, Natal etc.) com antecedência de envio recomendada.
+- [x] O Painel mostra as próximas datas-limite de envio.
+- [x] O planejador recebe as datas próximas ao sugerir conceitos.
 
 ### 7. Briefings com foco comercial
 - [ ] Modelos de briefing prontos para temas que compradores procuram: ingredientes e comida, fundos com espaço para texto, conceitos de negócio e tecnologia com uso claro, ambientes.

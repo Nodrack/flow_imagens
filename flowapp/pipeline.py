@@ -18,6 +18,7 @@ from flowapp.images import ImageValidationError
 from flowapp.orchestrator import PROJECT, Orchestrator
 from flowapp.profiles import load_profile
 from flowapp.schemas import CollectionBrief, ConceptPlan, WorkflowState
+from flowapp.seasonal import seasonal_context
 
 PLANNER = "planner"
 GENERATOR = "generator"
@@ -296,6 +297,7 @@ class AgentPipeline:
         planning = dict(collection.get("planning") or {})
         style_guide = planning.get("style_guide", "")
         avoid = [concept["data"]["concept"] for concept in self.database.list_concepts(ctx.subject)]
+        seasonal = seasonal_context(self.config.seasonal_calendar)
         created: list[str] = []
         ctx.agent(
             PLANNER, state="running", done=0, total=count,
@@ -310,6 +312,7 @@ class AgentPipeline:
                     ctx.progress(PLANNER),
                     count=batch, avoid=avoid, style_guide=style_guide, hint=hint,
                     lessons=adobe_lessons(self.database.adobe_feedback(), examples=True),
+                    seasonal=seasonal,
                 )
             except AgentError as error:
                 self.database.record_agent_run(

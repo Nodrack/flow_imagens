@@ -41,6 +41,9 @@ from flowapp.database import (
 )
 from flowapp.images import ImageStore, ImageValidationError
 from flowapp.similarity import matches_for_asset
+from flowapp.seasonal import (
+    RULE_LABELS, SeasonalCalendar, calendar_from_rows, calendar_rows, seasonal_deadlines,
+)
 from flowapp.metrics import (
     approval_rate, approved_per_week, collection_key, downloads_per_approved, format_hours,
     format_per_hour, revenue_per_hour,
@@ -189,6 +192,61 @@ def render_diagnostics(config: AppConfig, orchestrator: Orchestrator) -> None:
                 st.warning(f"LM Studio indisponível em {config.lmstudio_base_url}/api/v1/models")
 
 
+def render_seasonal_settings(calendar: SeasonalCalendar):
+    import pandas as pd
+    st.markdown("**Calendário sazonal**")
+    enabled = st.checkbox("Ativar calendário sazonal", value=calendar.enabled)
+    horizon = st.number_input("Horizonte dos prazos de envio (dias)", min_value=1, max_value=730,
+                              value=calendar.horizon_days)
+    st.caption("Mês e dia valem para datas fixas anuais; Data única vale só nessa regra. As outras regras recalculam a data a cada ano. Ajuste o Dia das Mães ao país e o verão ao mercado da campanha.")
+    # Keep the editor columns available even after the user removes every event.
+    table = pd.DataFrame(calendar_rows(calendar), columns=[
+        "Ativa", "Nome", "Regra", "Mês", "Dia", "Data única", "Antecedência (dias)", "Observação",
+    ])
+    rows = st.data_editor(table, num_rows="dynamic", hide_index=True,
+        key="seasonal_events_editor", column_config={
+            "Ativa": st.column_config.CheckboxColumn(default=True),
+            "Nome": st.column_config.TextColumn(required=True),
+            "Regra": st.column_config.SelectboxColumn(options=list(RULE_LABELS.values()), default=RULE_LABELS["fixed"], required=True),
+            "Mês": st.column_config.NumberColumn(min_value=1, max_value=12, step=1, default=1),
+            "Dia": st.column_config.NumberColumn(min_value=1, max_value=31, step=1, default=1),
+            "Data única": st.column_config.DateColumn(format="DD/MM/YYYY"),
+            "Antecedência (dias)": st.column_config.NumberColumn(min_value=0, max_value=365, step=1, default=90),
+            "Observação": st.column_config.TextColumn(),
+        })
+    st.caption("Antecedência inicial de 90 dias: ponto de partida editável, não prazo obrigatório da agência. "
+               "Referência: [orientação da Adobe sobre conteúdo sazonal](https://helpx.adobe.com/stock/contributor/help/artist-hub-migration/creat-what-s-in-demand.html), consultada em 24/10/2026.")
+    return enabled, int(horizon), rows.to_dict("records") if hasattr(rows, "to_dict") else rows
+
+
+def render_seasonal_calendar(calendar: SeasonalCalendar, reference_date: date | None = None) -> None:
+    st.subheader("Próximos prazos sazonais")
+    if not calendar.enabled:
+        st.caption("Calendário desativado. Ative na Configuração.")
+        return
+    rows = seasonal_deadlines(calendar, reference_date)
+    upcoming = [row for row in rows if row["days_left"] >= 0]
+    late = [row for row in rows if row["days_left"] < 0]
+    st.caption(f"Metas recomendadas de envio nos próximos {calendar.horizon_days} dias; datas de Madri. O envio continua manual.")
+
+    def table(entries):
+        st.dataframe([{"Evento": row["name"], "Data da campanha": row["event_date"],
+                       "Enviar até": row["deadline"], "Antecedência (dias)": row["lead_days"],
+                       "Dias até o prazo": row["days_left"],
+                       "Situação": "Hoje" if row["status"] == "today" else "Prazo encerrado" if row["status"] == "late" else "A planejar",
+                       "Observação": row["notes"]} for row in entries], hide_index=True,
+            column_config={"Data da campanha": st.column_config.DateColumn(format="DD/MM/YYYY"),
+                           "Enviar até": st.column_config.DateColumn(format="DD/MM/YYYY")})
+
+    if upcoming:
+        table(upcoming)
+    else:
+        st.info("Nenhum prazo futuro nesta janela. Ajuste o calendário na Configuração.")
+    if late:
+        with st.expander("Campanhas próximas com prazo recomendado encerrado"):
+            table(late)
+
+
 def render_settings(config: AppConfig) -> AppConfig:
     st.subheader("Conexões e limites")
     st.caption("Os endereços são locais por padrão. O token opcional do LM Studio vem da variável LM_STUDIO_API_KEY.")
@@ -312,8 +370,14 @@ def render_settings(config: AppConfig) -> AppConfig:
                 min_value=2, max_value=16, value=config.similarity_rules.palette_bins),
         }
         st.caption("Paleta semelhante é um alerta amplo: confirme assunto e composição. Nenhum modelo usa VRAM nesta análise.")
+        calendar_enabled, calendar_horizon, calendar_edits = render_seasonal_settings(config.seasonal_calendar)
         saved = st.form_submit_button("Salvar configuração", type="primary")
     if saved:
+        try:
+            seasonal_calendar = calendar_from_rows(calendar_edits, enabled=calendar_enabled, horizon_days=calendar_horizon)
+        except (ValueError, TypeError, KeyError) as error:
+            st.error(f"Calendário inválido; a configuração não foi salva: {error}")
+            return config
         new_config = AppConfig(
             comfy_base_url=comfy_url,
             lmstudio_base_url=lm_url,
@@ -332,6 +396,7 @@ def render_settings(config: AppConfig) -> AppConfig:
             timer_max_hours=float(timer_max_hours),
             quality_rules=quality_values,
             similarity_rules=similarity_values,
+            seasonal_calendar=seasonal_calendar,
             export_rules={
                 "min_megapixels": min_mp or None,
                 "max_megapixels": max_mp or None,
@@ -3073,6 +3138,8 @@ def main() -> None:
         ):
             column.metric(label, counts.get(state, 0))
         st.caption("A declaração de conteúdo gerado por IA e a elegibilidade final são conferidas manualmente no portal Adobe.")
+        st.divider()
+        render_seasonal_calendar(config.seasonal_calendar)
         st.divider()
         render_collection_overview(database, orchestrator, collections, collection_id)
         st.divider()
