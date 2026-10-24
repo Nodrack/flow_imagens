@@ -19,6 +19,7 @@ from flowapp.config import AppConfig
 from flowapp.database import Database
 from flowapp.images import ImageStore, ImageValidationError
 from flowapp.similarity import SimilarityChecker, matches_for_asset
+from flowapp.agency_exports import metadata_reference
 from flowapp.profiles import load_profile
 from flowapp.schemas import ComfyWorkflowProfile, ConceptPlan, WorkflowState
 
@@ -483,6 +484,7 @@ class Orchestrator:
         """Exporta o JPEG final com metadados e registra o pacote como pronto para transferência."""
         if concept["state"] != WorkflowState.METADATA_READY.value:
             raise ValueError("Aprove os metadados antes de preparar o pacote.")
+        self.config.agency_exports.profile("adobe").require_active()
         upscaled = [asset for asset in self.database.list_assets(concept["id"]) if asset["role"] == "upscaled"]
         if not upscaled:
             raise ValueError("O conceito não tem imagem ampliada.")
@@ -515,6 +517,58 @@ class Orchestrator:
 
     def similarity_checker(self) -> SimilarityChecker:
         return SimilarityChecker(self.database, self.images.data_root, self.config.similarity_rules)
+
+    def prepare_agency_package(
+        self, concept: dict, profile_id: str, *, preview: bool = False,
+        allow_warnings: bool = False, conditions_reviewed: bool = False,
+    ) -> tuple[Path, dict]:
+        profile = self.config.agency_exports.profile(profile_id)
+        profile.require_active()
+        if profile_id == "adobe":
+            raise ValueError("Use a preparação Adobe existente para esse perfil.")
+        allowed_states = {"metadata_ready", "locally_approved", "prepared_for_transfer", "transferred",
+                          "submitted", "adobe_approved", "adobe_rejected"}
+        if concept["state"] not in allowed_states:
+            raise ValueError("Aprove os metadados da imagem final antes de exportar.")
+        assets = [asset for asset in self.database.list_assets(concept["id"]) if asset["role"] == "upscaled"]
+        if not assets:
+            raise ValueError("O conceito não tem imagem ampliada.")
+        asset = assets[-1]
+        metadata = asset.get("metadata") or {}
+        if not metadata.get("title_en") or not metadata.get("keywords"):
+            raise ValueError("Salve título e palavras-chave antes de exportar.")
+        similarity = self.similarity_checker().report(asset["collection_id"], asset=asset,
+                                                       title=concept["data"]["concept"])
+        related = matches_for_asset(similarity, asset["id"])
+        _, report = self.images.export_jpeg(asset, metadata["title_en"], metadata["keywords"], profile.rules,
+            quality_rules=self.config.quality_rules, preview=True, profile=profile)
+        report["similarity"] = {**similarity, "matches": related, "rules": self.config.similarity_rules.model_dump()}
+        for match in related:
+            other = match["right"] if match["left"]["id"] == asset["id"] else match["left"]
+            report["warnings"].append(f"Semelhança com {other['title']}: " + " ".join(match["reasons"]))
+        if similarity["missing_history"] or similarity["unreadable"]:
+            report["warnings"].append("Comparação de similaridade incompleta: faltam referências legíveis.")
+        report["blocked"] = report["technical"]["status"] == "blocked" or any(match["blocked"] for match in related)
+        if preview:
+            return Path(asset["path"]), report
+        if not conditions_reviewed:
+            raise ValueError("Confirme que revisou as condições do perfil para esta imagem.")
+        if report["blocked"]:
+            raise ImageValidationError("Exportação bloqueada: " + " ".join(report["warnings"]))
+        if report["warnings"] and not allow_warnings:
+            raise ImageValidationError("Revise e confirme os alertas antes de exportar.")
+        output, saved = self.images.export_jpeg(asset, metadata["title_en"], metadata["keywords"], profile.rules,
+            quality_rules=self.config.quality_rules, allow_warnings=allow_warnings, profile=profile)
+        saved["warnings"] = report["warnings"]
+        saved["similarity"] = report["similarity"]
+        saved["conditions_reviewed"] = True
+        suffix = ".metadata.json" if profile.metadata_format == "json" else ".metadata.csv"
+        saved["metadata_path"] = str(output.with_suffix(suffix))
+        reference, _ = metadata_reference(saved, profile)
+        with output.with_suffix(suffix).open("x", encoding="utf-8", newline="") as sidecar:
+            sidecar.write(reference)
+        self.database.record_agency_export(asset, profile_id, saved)
+        return output, saved
 
     def upscale_selected(
         self, collection_id: str, concept: dict, asset: dict, progress: Progress | None = None,

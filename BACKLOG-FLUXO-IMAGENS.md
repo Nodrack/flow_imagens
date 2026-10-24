@@ -73,8 +73,10 @@ Custos entram no resultado após custos por hora, com a receita/hora preservada 
 ## P2. Distribuição e nome
 
 ### 9. Perfis de exportação por agência
-- [ ] Perfis de exportação configuráveis (dimensões, formato e arquivo de metadados) para outras agências além da Adobe.
-- [ ] Antes de ativar um perfil, conferir as regras atuais daquela agência para imagens geradas por IA e registrar a fonte e a data, como já é feito para a Adobe.
+- [x] Perfis de exportação configuráveis (dimensões, formato e arquivo de metadados) para outras agências além da Adobe.
+- [x] Antes de ativar um perfil, conferir as regras atuais daquela agência para imagens geradas por IA e registrar a fonte e a data, como já é feito para a Adobe.
+
+Fontes e políticas registradas em 25/10/2026. Dreamstime disponível com condições; Freepik/Magnific em rascunho técnico; Shutterstock e Getty/iStock desativados conforme suas políticas. Pacotes separados do fluxo Adobe, com metadados de referência manual.
 
 ### 10. Nome da ferramenta
 - [ ] Aguardando decisão (opções: Safra, Viveiro, Prensa, Lote, Ateliê). Depois de decidido, trocar o título do app e as referências na interface.

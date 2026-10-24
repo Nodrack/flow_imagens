@@ -36,6 +36,7 @@ from flowapp.agents import AgentError, INSTRUCTION_VERSION, adobe_lessons
 from flowapp.briefings import (
     CommercialBriefings, ORIENTATIONS, template_widget_values, templates_from_rows, templates_rows,
 )
+from flowapp.agency_exports import AgencyExportProfile, AgencyExportsConfig
 from flowapp.comfy import ComfyError
 from flowapp.config import AppConfig, load_config, save_config
 from flowapp.database import (
@@ -463,6 +464,7 @@ def render_settings(config: AppConfig) -> AppConfig:
                 "checked_at": "2026-09-30",
                 "source": source,
             },
+            agency_exports=config.agency_exports,
         )
         save_config(CONFIG_PATH, new_config)
         get_orchestrator.clear()
@@ -470,6 +472,77 @@ def render_settings(config: AppConfig) -> AppConfig:
         st.session_state["settings_saved"] = True
         st.rerun()
     return config
+
+
+def render_agency_profile_settings(config: AppConfig) -> None:
+    with st.expander("Perfis de exportação por agência"):
+        if st.session_state.pop("agency_profile_saved", False):
+            st.success("Perfil salvo.")
+        profiles = {profile.id: profile for profile in config.agency_exports.profiles}
+        selected = st.selectbox("Perfil para editar", [*profiles, None],
+            format_func=lambda value: profiles[value].name if value else "Criar perfil")
+        profile = profiles[selected] if selected else AgencyExportProfile(id="nova_agencia", name="Nova agência")
+        policy_labels = {"unknown": "Não conferida", "allowed": "Permite IA", "conditional": "Permite IA com condições", "not_allowed": "Não permite IA de colaboradores"}
+        with st.form(f"agency_profile_form_{selected or 'new'}"):
+            profile_id = st.text_input("Identificador do perfil", profile.id, disabled=selected is not None,
+                                      help="Use letras minúsculas, números, hífen ou sublinhado; comece com uma letra.")
+            name = st.text_input("Nome da agência", profile.name)
+            enabled = st.checkbox("Ativar perfil de exportação", value=profile.enabled)
+            policy = st.selectbox("Política para IA", list(policy_labels), index=list(policy_labels).index(profile.ai_policy), format_func=policy_labels.get)
+            policy_source = st.text_input("Fonte oficial da política de IA", profile.policy_source)
+            policy_date = st.date_input("Política consultada em", value=profile.policy_checked_on, max_value=today_local())
+            verified = st.checkbox("Conferi a política de IA na fonte indicada", value=profile.policy_verified)
+            notes = st.text_area("Condições para revisar antes do envio", profile.policy_notes, max_chars=2000)
+            changes = dict(id=profile_id, name=name, enabled=enabled, ai_policy=policy,
+                           policy_source=policy_source, policy_checked_on=policy_date, policy_verified=verified, policy_notes=notes)
+            if profile.id == "adobe" and selected:
+                st.caption("Formato, limites e CSV Adobe continuam na configuração e no fluxo Adobe existentes.")
+            else:
+                formats = st.multiselect("Formatos conferidos na fonte técnica", ["JPEG", "PNG"], default=profile.allowed_formats)
+                file_format = st.selectbox("Formato de saída", ["JPEG", "PNG"], index=["JPEG", "PNG"].index(profile.file_format))
+                metadata_format = st.selectbox("Arquivo de metadados", ["json", "csv"],
+                    index=["json", "csv"].index(profile.metadata_format), format_func=lambda value: f"{value.upper()} de referência manual")
+                st.caption("O JSON/CSV de referência não é anunciado como formato de importação da agência. Os metadados também ficam embutidos na imagem.")
+                width = st.number_input("Largura máxima de saída (0 = manter)", min_value=0, max_value=32768, value=profile.max_width or 0)
+                height = st.number_input("Altura máxima de saída (0 = manter)", min_value=0, max_value=32768, value=profile.max_height or 0)
+                short_edge = st.number_input("Lado menor mínimo (0 = não configurado)", min_value=0, max_value=32768, value=profile.min_short_edge or 0)
+                st.caption("A redução preserva a proporção. Este perfil não amplia nem recorta a imagem.")
+                minimum = st.number_input("MP mínimos do perfil (0 = não configurado)", min_value=0.0, value=float(profile.rules.min_megapixels or 0))
+                maximum = st.number_input("MP máximos do perfil (0 = não configurado)", min_value=0.0, value=float(profile.rules.max_megapixels or 0))
+                file_bytes = st.number_input("Bytes máximos do perfil (0 = não configurado)", min_value=0, value=profile.rules.max_file_bytes or 0)
+                quality = st.slider("Qualidade JPEG do perfil", 85, 100, profile.rules.jpeg_quality)
+                technical_source = st.text_input("Fonte dos requisitos técnicos do perfil", profile.rules.source)
+                try:
+                    technical_date = date.fromisoformat(profile.rules.checked_at)
+                except ValueError:
+                    technical_date = None
+                technical_date = st.date_input("Requisitos técnicos consultados em", value=technical_date, max_value=today_local())
+                technical_verified = st.checkbox("Conferi os requisitos técnicos deste perfil", value=profile.rules.technical_rules_verified)
+                suffix = st.text_input("Identificação de IA a acrescentar ao título", profile.ai_title_suffix)
+                keywords = st.text_input("Palavras-chave obrigatórias (separe por ;)", "; ".join(profile.required_keywords))
+                changes.update(file_format=file_format, allowed_formats=formats, metadata_format=metadata_format,
+                    max_width=width or None, max_height=height or None, ai_title_suffix=suffix,
+                    min_short_edge=short_edge or None,
+                    required_keywords=[part.strip() for part in keywords.split(";") if part.strip()],
+                    rules={"min_megapixels": minimum or None, "max_megapixels": maximum or None,
+                           "max_file_bytes": file_bytes or None, "jpeg_quality": quality,
+                           "technical_rules_verified": technical_verified,
+                           "checked_at": technical_date.isoformat() if technical_date else "", "source": technical_source})
+            save = st.form_submit_button("Salvar perfil de exportação")
+        if save:
+            try:
+                updated = AgencyExportProfile.model_validate(profile.model_dump() | changes)
+                rows = [updated if row.id == selected else row for row in config.agency_exports.profiles]
+                if selected is None:
+                    rows.append(updated)
+                settings = AgencyExportsConfig(profiles=rows)
+                save_config(CONFIG_PATH, config.model_copy(update={"agency_exports": settings}))
+                get_orchestrator.clear()
+                get_agent_pipeline.clear()
+                st.session_state["agency_profile_saved"] = True
+                st.rerun()
+            except (ValueError, TypeError) as error:
+                st.error(f"Perfil inválido; a configuração não foi salva: {error}")
 
 
 def render_manual_collection_creation(database: Database, orchestrator: Orchestrator) -> None:
@@ -1895,6 +1968,23 @@ def render_export(orchestrator: Orchestrator, collection_id: str | None) -> None
         return
     database = orchestrator.database
     concepts = database.list_concepts(collection_id)
+    profiles = {profile.id: profile for profile in orchestrator.config.agency_exports.profiles}
+    selected_profile = st.selectbox("Agência de exportação", list(profiles),
+        format_func=lambda value: profiles[value].name + (" — desativado" if not profiles[value].enabled else ""),
+        key=f"export_agency_{collection_id}")
+    profile = profiles[selected_profile]
+    st.caption(f"Política de IA consultada em {profile.policy_checked_on or 'data não registrada'} · [Fonte]({profile.policy_source})")
+    if profile.policy_notes:
+        st.info(profile.policy_notes)
+    try:
+        profile.require_active()
+    except ValueError as error:
+        st.warning(str(error))
+        st.caption("Revise o perfil em Configuração → Perfis de exportação por agência.")
+        return
+    if selected_profile != "adobe":
+        render_additional_agency_export(orchestrator, collection_id, profile, concepts)
+        return
     similarity = orchestrator.similarity_checker().report(collection_id)
     with st.expander("Similaridade do pacote e do histórico", expanded=bool(similarity["matches"])):
         render_similarity_report(similarity)
@@ -1938,6 +2028,58 @@ def render_export(orchestrator: Orchestrator, collection_id: str | None) -> None
     for concept in concepts:
         st.divider()
         render_concept_export(orchestrator, collection_id, concept, similarity)
+
+
+def render_additional_agency_export(orchestrator: Orchestrator, collection_id: str,
+                                    profile: AgencyExportProfile, concepts: list[dict]) -> None:
+    st.caption("Pacote local para envio manual. O registro de moderação e os indicadores existentes continuam destinados à Adobe.")
+    st.caption("Metadados embutidos e arquivo de referência manual. O JSON/CSV deste perfil não é um esquema de importação homologado pela agência.")
+    eligible = [concept for concept in concepts if concept["state"] in {
+        "metadata_ready", "locally_approved", "prepared_for_transfer", "transferred", "submitted", "adobe_approved", "adobe_rejected"}
+        and final_upscale(orchestrator.database, concept["id"])]
+    if not eligible:
+        st.info("Nenhuma imagem final com metadados prontos para exportar.")
+        return
+    lookup = {concept["id"]: concept for concept in eligible}
+    concept_id = st.selectbox("Imagem para este perfil", list(lookup),
+        format_func=lambda value: lookup[value]["data"]["concept"], key=f"agency_image_{profile.id}_{collection_id}")
+    concept = lookup[concept_id]
+    asset = final_upscale(orchestrator.database, concept_id)
+    try:
+        _, preview = orchestrator.prepare_agency_package(concept, profile.id, preview=True)
+    except Exception as error:
+        show_error(error)
+        return
+    st.image(asset["path"], caption="Imagem final de origem", width="stretch")
+    st.write(preview["title"])
+    st.caption(f"Saída: {preview['format']} · {preview['width']} × {preview['height']} · {preview['megapixels']:.2f} MP · {preview['size_bytes']/1_000_000:.2f} MB")
+    st.json(preview["technical"], expanded=False)
+    for warning in preview["warnings"]:
+        st.warning(warning)
+    token = hashlib.sha256(json.dumps([profile.model_dump(mode="json"), asset["sha256"], preview],
+                                      sort_keys=True).encode()).hexdigest()[:16]
+    reviewed = st.checkbox("Conferi os direitos e condições do perfil para esta imagem", key=f"agency_review_{token}")
+    confirmed = st.checkbox("Revisei os alertas deste pacote", key=f"agency_warnings_{token}") if preview["warnings"] else True
+    if st.button(f"Preparar pacote para {profile.name}", type="primary", disabled=preview["blocked"] or not reviewed or not confirmed):
+        try:
+            orchestrator.prepare_agency_package(concept, profile.id, allow_warnings=confirmed, conditions_reviewed=reviewed)
+            st.rerun()
+        except Exception as error:
+            show_error(error)
+    records = orchestrator.database.list_agency_exports(collection_id, profile.id)
+    if records:
+        st.dataframe([{"Imagem": row["report"]["filename"], "Título": row["report"]["title"],
+                       "Preparado em": row["created_at"]} for row in records], hide_index=True)
+        latest = next((row["report"] for row in records if row["asset_id"] == asset["id"]), None)
+        if latest:
+            image_path, metadata_path = Path(latest["path"]), Path(latest["metadata_path"])
+            st.caption(f"Pasta do perfil: {image_path.parent}")
+            if image_path.is_file():
+                st.download_button("Baixar imagem preparada", image_path.read_bytes(), file_name=image_path.name,
+                    mime="image/jpeg" if latest["format"] == "JPEG" else "image/png")
+            if metadata_path.is_file():
+                st.download_button("Baixar metadados de referência", metadata_path.read_bytes(), file_name=metadata_path.name,
+                    mime="application/json" if metadata_path.suffix == ".json" else "text/csv")
 
 
 def render_transfer_all(orchestrator: Orchestrator, collection_id: str, concepts: list[dict]) -> None:
@@ -3315,6 +3457,7 @@ def main() -> None:
     with tabs[8]:
         st.title("Configuração")
         updated = render_settings(config)
+        render_agency_profile_settings(config)
         if updated != config:
             st.info("Recarregue a aplicação para aplicar URLs e modelos alterados aos clientes em memória.")
         st.divider()

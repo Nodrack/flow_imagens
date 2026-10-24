@@ -6,12 +6,13 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from PIL import Image, ImageCms, ImageOps, UnidentifiedImageError
+from PIL import Image, ImageCms, ImageOps, PngImagePlugin, UnidentifiedImageError
 
 from flowapp.adobe import build_iptc_app13, build_xmp, category_number, insert_app13
 from flowapp.database import Database, utc_now
 from flowapp.schemas import ExportRules
 from flowapp.quality import QualityRules, inspect_image
+from flowapp.agency_exports import AgencyExportProfile
 
 
 class ImageValidationError(ValueError):
@@ -119,13 +120,24 @@ class ImageStore:
         quality_rules: QualityRules | None = None,
         allow_warnings: bool = False,
         preview: bool = False,
+        profile: AgencyExportProfile | None = None,
     ) -> tuple[Path, dict[str, Any]]:
         source_path = Path(asset["path"])
         if not source_path.is_file():
             raise ImageValidationError("O arquivo final selecionado não existe mais.")
+        if profile is not None:
+            profile = AgencyExportProfile.model_validate(profile.model_dump())
+            profile.require_active()
+            rules = profile.rules
+            title, keywords = profile.metadata_values(title, keywords)
+        file_format = profile.file_format if profile else "JPEG"
         with Image.open(source_path) as opened:
             opened.load()
             image = ImageOps.exif_transpose(opened)
+            if profile and (profile.max_width or profile.max_height):
+                image.thumbnail((profile.max_width or image.width, profile.max_height or image.height), Image.Resampling.LANCZOS)
+            alpha = image.convert("RGBA").getchannel("A") if file_format == "PNG" and (
+                "A" in image.getbands() or "transparency" in opened.info) else None
             width, height = image.size
             megapixels = width * height / 1_000_000
             warnings: list[str] = []
@@ -151,37 +163,49 @@ class ImageStore:
                 image = image.convert("RGB")
             srgb_bytes = ImageCms.ImageCmsProfile(srgb).tobytes()
             output = io.BytesIO()
-            image.save(
-                output,
-                format="JPEG",
-                quality=rules.jpeg_quality,
-                optimize=True,
-                icc_profile=srgb_bytes,
-                xmp=build_xmp(title, keywords),
-            )
-        content = insert_app13(output.getvalue(), build_iptc_app13(title, keywords))
+            if file_format == "JPEG":
+                image.save(output, format="JPEG", quality=rules.jpeg_quality, optimize=True,
+                           icc_profile=srgb_bytes, xmp=build_xmp(title, keywords))
+            else:
+                if alpha is not None:
+                    image.putalpha(alpha)
+                png_info = PngImagePlugin.PngInfo()
+                png_info.add_itxt("XML:com.adobe.xmp", build_xmp(title, keywords).decode("utf-8"))
+                png_info.add_itxt("Title", title)
+                png_info.add_itxt("Keywords", ", ".join(keywords))
+                image.save(output, format="PNG", icc_profile=srgb_bytes, pnginfo=png_info)
+        content = output.getvalue()
+        if file_format == "JPEG":
+            content = insert_app13(content, build_iptc_app13(title, keywords))
         if rules.max_file_bytes is not None and len(content) > rules.max_file_bytes:
             warnings.append(f"Arquivo excede o limite configurado ({rules.max_file_bytes} bytes).")
         technical = inspect_image(content, quality_rules or QualityRules(), rules)
+        if profile and profile.min_short_edge and min(width, height) < profile.min_short_edge:
+            technical["status"] = "blocked"
+            technical["reasons"].append(f"Lado menor abaixo do mínimo configurado ({profile.min_short_edge} pixels).")
         # Check the encoded JPEG as well; metadata contributes to its actual size.
         if rules.max_file_bytes is not None and len(content) > rules.max_file_bytes:
             technical["status"] = "blocked"
-            technical["reasons"].append("JPEG excede o tamanho máximo configurado.")
-        technical["metrics"]["jpeg_size_bytes"] = len(content)
+            technical["reasons"].append(f"{file_format} excede o tamanho máximo configurado.")
+        technical["metrics"]["jpeg_size_bytes" if file_format == "JPEG" else "png_size_bytes"] = len(content)
         warnings.extend(technical["reasons"])
         if preview:
-            return source_path, {"technical": technical, "warnings": warnings}
-        if quality_rules is not None:
+            return source_path, {"technical": technical, "warnings": warnings, "width": width, "height": height,
+                                 "megapixels": megapixels, "size_bytes": len(content), "format": file_format,
+                                 "title": title, "keywords": keywords}
+        if quality_rules is not None or profile is not None:
             if technical["status"] == "blocked":
                 raise ImageValidationError("Exportação bloqueada: " + " ".join(technical["reasons"]))
             if warnings and not allow_warnings:
                 raise ImageValidationError("Confirme os alertas antes de exportar: " + " ".join(warnings))
         digest = hashlib.sha256(content).hexdigest()
         root = self.collection_path(asset["collection_id"])
-        exports = root / "exports"
+        exports = root / "agency_exports" / profile.id if profile else root / "exports"
         exports.mkdir(parents=True, exist_ok=True)
         stem = f"{asset['id'][:8]}-{digest[:12]}"
-        destination = exports / f"{stem}.jpg"
+        if profile:
+            stem += f"-{uuid.uuid4().hex[:6]}"
+        destination = exports / f"{stem}.{'jpg' if file_format == 'JPEG' else 'png'}"
         with destination.open("xb") as output_file:
             output_file.write(content)
         metadata = asset.get("metadata", {})
@@ -203,6 +227,11 @@ class ImageStore:
             "source_sha256": asset["sha256"],
             "technical_rules_verified": rules.technical_rules_verified,
             "exported_at": utc_now(),
+            "format": file_format,
         }
-        self.database.update_asset_export(asset["id"], result)
+        if profile:
+            result.pop("adobe_category", None)
+            result["agency_profile"] = profile.model_dump(mode="json")
+        else:
+            self.database.update_asset_export(asset["id"], result)
         return destination, result

@@ -213,5 +213,158 @@
   "visual_reference_limit": 12,
   "visual_reference_prompt_chars": 600,
   "comfy_generation_url": "",
-  "comfy_upscale_url": ""
+  "comfy_upscale_url": "",
+  "agency_exports": {
+    "profiles": [
+      {
+        "id": "adobe",
+        "name": "Adobe Stock",
+        "enabled": true,
+        "ai_policy": "conditional",
+        "policy_verified": true,
+        "policy_source": "https://helpx.adobe.com/stock/contributor/submit-your-content/submit-generative-ai-content/generative-ai-content-guidelines.html",
+        "policy_checked_on": "2026-10-25",
+        "policy_notes": "Declarar conteúdo criado com IA no portal e conferir direitos, pessoas e propriedades. O fluxo Adobe e seus limites existentes continuam disponíveis.",
+        "file_format": "JPEG",
+        "allowed_formats": [
+          "JPEG"
+        ],
+        "metadata_format": "adobe_csv",
+        "max_width": null,
+        "max_height": null,
+        "min_short_edge": null,
+        "rules": {
+          "min_megapixels": null,
+          "max_megapixels": null,
+          "max_file_bytes": null,
+          "jpeg_quality": 95,
+          "technical_rules_verified": false,
+          "checked_at": "2026-09-30",
+          "source": ""
+        },
+        "ai_title_suffix": "",
+        "required_keywords": []
+      },
+      {
+        "id": "dreamstime",
+        "name": "Dreamstime",
+        "enabled": true,
+        "ai_policy": "conditional",
+        "policy_verified": true,
+        "policy_source": "https://www.dreamstime.com/faqs-detail-2",
+        "policy_checked_on": "2026-10-25",
+        "policy_notes": "Conferir direitos de uso, identificar IA no título/descrição e selecionar a categoria Generative AI no portal. Não enviar rostos humanos realistas gerados; as exceções da FAQ precisam de revisão humana.",
+        "file_format": "JPEG",
+        "allowed_formats": [
+          "JPEG"
+        ],
+        "metadata_format": "json",
+        "max_width": null,
+        "max_height": null,
+        "min_short_edge": null,
+        "rules": {
+          "min_megapixels": 3.0,
+          "max_megapixels": null,
+          "max_file_bytes": null,
+          "jpeg_quality": 95,
+          "technical_rules_verified": true,
+          "checked_at": "2026-10-25",
+          "source": "https://www.dreamstime.com/faqs-detail-2"
+        },
+        "ai_title_suffix": "[AI-generated]",
+        "required_keywords": []
+      },
+      {
+        "id": "freepik",
+        "name": "Freepik / Magnific (rascunho)",
+        "enabled": false,
+        "ai_policy": "conditional",
+        "policy_verified": true,
+        "policy_source": "https://www.magnific.com/ai/contributors/ai-generated-resources-general-guidelines",
+        "policy_checked_on": "2026-10-25",
+        "policy_notes": "A orientação oficial exige marcar conteúdo como criado por IA. Perfil pendente de conferência dos limites técnicos; não há esquema CSV de importação validado neste app.",
+        "file_format": "JPEG",
+        "allowed_formats": [
+          "JPEG"
+        ],
+        "metadata_format": "json",
+        "max_width": null,
+        "max_height": null,
+        "min_short_edge": null,
+        "rules": {
+          "min_megapixels": null,
+          "max_megapixels": null,
+          "max_file_bytes": null,
+          "jpeg_quality": 95,
+          "technical_rules_verified": false,
+          "checked_at": "2026-09-30",
+          "source": ""
+        },
+        "ai_title_suffix": "",
+        "required_keywords": [
+          "_ai_generated"
+        ]
+      },
+      {
+        "id": "shutterstock",
+        "name": "Shutterstock — IA não aceita",
+        "enabled": false,
+        "ai_policy": "not_allowed",
+        "policy_verified": true,
+        "policy_source": "https://submit.shutterstock.com/help/en/articles/10594622-content-policy-updates-ai-generated-content",
+        "policy_checked_on": "2026-10-25",
+        "policy_notes": "A política consultada não aceita conteúdo gerado por IA enviado por colaboradores.",
+        "file_format": "JPEG",
+        "allowed_formats": [
+          "JPEG",
+          "PNG"
+        ],
+        "metadata_format": "json",
+        "max_width": null,
+        "max_height": null,
+        "min_short_edge": null,
+        "rules": {
+          "min_megapixels": null,
+          "max_megapixels": null,
+          "max_file_bytes": null,
+          "jpeg_quality": 95,
+          "technical_rules_verified": false,
+          "checked_at": "2026-09-30",
+          "source": ""
+        },
+        "ai_title_suffix": "",
+        "required_keywords": []
+      },
+      {
+        "id": "getty",
+        "name": "Getty / iStock — IA não aceita",
+        "enabled": false,
+        "ai_policy": "not_allowed",
+        "policy_verified": true,
+        "policy_source": "https://www.gettyimages.co.uk/workwithus",
+        "policy_checked_on": "2026-10-25",
+        "policy_notes": "A página para colaboradores não aceita arquivos criados ou modificados por modelos generativos.",
+        "file_format": "JPEG",
+        "allowed_formats": [
+          "JPEG",
+          "PNG"
+        ],
+        "metadata_format": "json",
+        "max_width": null,
+        "max_height": null,
+        "min_short_edge": null,
+        "rules": {
+          "min_megapixels": null,
+          "max_megapixels": null,
+          "max_file_bytes": null,
+          "jpeg_quality": 95,
+          "technical_rules_verified": false,
+          "checked_at": "2026-09-30",
+          "source": ""
+        },
+        "ai_title_suffix": "",
+        "required_keywords": []
+      }
+    ]
+  }
 }

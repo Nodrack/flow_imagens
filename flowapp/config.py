@@ -13,6 +13,7 @@ from flowapp.quality import QualityRules
 from flowapp.similarity import SimilarityRules
 from flowapp.seasonal import SeasonalCalendar
 from flowapp.briefings import CommercialBriefings
+from flowapp.agency_exports import AgencyExportsConfig
 
 
 class AppConfig(BaseModel):
@@ -49,6 +50,7 @@ class AppConfig(BaseModel):
     visual_reference_limit: int = Field(default=12, ge=1, le=100)
     visual_reference_prompt_chars: int = Field(default=600, ge=50, le=4000)
     export_rules: ExportRules = Field(default_factory=ExportRules)
+    agency_exports: AgencyExportsConfig = Field(default_factory=AgencyExportsConfig)
     # Cronômetro de horas que passar disso é tratado como esquecido e pede os minutos reais.
     timer_max_hours: float = Field(default=12.0, ge=1, le=24)
 
