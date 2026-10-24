@@ -322,6 +322,12 @@ class Database:
                     created_at TEXT NOT NULL, updated_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS ix_moderation_collection ON moderation_records(collection_id);
+                CREATE TABLE IF NOT EXISTS similarity_references (
+                    moderation_record_id TEXT NOT NULL REFERENCES moderation_records(id),
+                    path TEXT NOT NULL, sha256 TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (moderation_record_id, sha256)
+                );
                 CREATE INDEX IF NOT EXISTS ix_concepts_collection ON concepts(collection_id, created_at);
                 CREATE INDEX IF NOT EXISTS ix_assets_concept ON assets(concept_id, created_at);
                 CREATE INDEX IF NOT EXISTS ix_jobs_status ON jobs(status, created_at);
@@ -1819,3 +1825,15 @@ class Database:
                 "WHERE minutes IS NOT NULL GROUP BY collection_id"
             ).fetchall()
         return {row["collection_id"]: row["minutes"] or 0.0 for row in rows}
+
+    def list_similarity_references(self) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            return [dict(row) for row in connection.execute("SELECT * FROM similarity_references")]
+
+    def add_similarity_reference(self, record_id: str, path: Path, sha256: str) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO similarity_references "
+                "(moderation_record_id, path, sha256, created_at) VALUES (?, ?, ?, ?)",
+                (record_id, str(path), sha256, utc_now()),
+            )

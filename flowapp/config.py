@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from flowapp.schemas import ExportRules
 from flowapp.quality import QualityRules
+from flowapp.similarity import SimilarityRules
 
 
 class AppConfig(BaseModel):
@@ -37,6 +38,7 @@ class AppConfig(BaseModel):
     # Multiplicador aplicado ao tamanho da imagem escolhida quando o workflow de upscale mapeia width/height.
     upscale_factor: float = Field(default=2.0, ge=1, le=8)
     quality_rules: QualityRules = Field(default_factory=QualityRules)
+    similarity_rules: SimilarityRules = Field(default_factory=SimilarityRules)
     export_rules: ExportRules = Field(default_factory=ExportRules)
     # Cronômetro de horas que passar disso é tratado como esquecido e pede os minutos reais.
     timer_max_hours: float = Field(default=12.0, ge=1, le=24)

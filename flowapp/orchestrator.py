@@ -18,6 +18,7 @@ from flowapp.comfy import ComfyError, ComfyUIClient
 from flowapp.config import AppConfig
 from flowapp.database import Database
 from flowapp.images import ImageStore, ImageValidationError
+from flowapp.similarity import SimilarityChecker, matches_for_asset
 from flowapp.profiles import load_profile
 from flowapp.schemas import ComfyWorkflowProfile, ConceptPlan, WorkflowState
 
@@ -455,15 +456,31 @@ class Orchestrator:
         metadata = asset.get("metadata") or {}
         if not metadata.get("title_en") or not metadata.get("keywords"):
             raise ValueError("O conceito não tem título e palavras-chave salvos.")
+        similarity = self.similarity_checker().report(
+            asset["collection_id"], asset=asset, title=concept["data"]["concept"],
+        )
+        related = matches_for_asset(similarity, asset["id"])
+        if any(match["blocked"] for match in related):
+            raise ImageValidationError("Exportação bloqueada pela regra de uma imagem por conceito. Reveja a Configuração.")
+        incomplete = similarity["missing_history"] or similarity["unreadable"]
+        if (related or incomplete) and not allow_warnings:
+            raise ImageValidationError("Revise e confirme os alertas de similaridade antes de exportar.")
         output, report = self.images.export_jpeg(
             asset, metadata["title_en"], metadata["keywords"], self.config.export_rules,
             quality_rules=self.config.quality_rules, allow_warnings=allow_warnings,
         )
+        report["similarity"] = {**similarity, "matches": related,
+                                "rules": self.config.similarity_rules.model_dump(),
+                                "warnings_confirmed": bool(allow_warnings)}
+        self.database.update_asset_export(asset["id"], report)
         self.database.transition_concept(concept["id"], WorkflowState.LOCALLY_APPROVED, "Aprovação local do pacote")
         self.database.transition_concept(
             concept["id"], WorkflowState.PREPARED_FOR_TRANSFER, "JPEG e metadados auxiliares preparados localmente",
         )
         return output, report
+
+    def similarity_checker(self) -> SimilarityChecker:
+        return SimilarityChecker(self.database, self.images.data_root, self.config.similarity_rules)
 
     def upscale_selected(
         self, collection_id: str, concept: dict, asset: dict, progress: Progress | None = None,

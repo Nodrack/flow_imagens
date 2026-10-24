@@ -86,7 +86,7 @@ Execute a suíte sem inferência ou geração real:
 - Nenhum workflow API foi importado neste projeto; geração e upscale reais exigem importar e validar os seus.
 - Nenhum modelo LM Studio foi carregado ou chamado durante o desenvolvimento. O app não baixa nem altera modelos.
 - Não existe integração oficial confirmada para upload Adobe nesta implementação; envio é manual.
-- Importação de relatórios oficiais, detecção de similaridade e correções automáticas ficam para etapas futuras; o inpainting disponível é sempre disparado e revisado por uma pessoa.
+- Correções automáticas ficam para etapas futuras; o inpainting disponível é sempre disparado e revisado por uma pessoa.
 - Requisitos técnicos numéricos Adobe e esquema CSV não foram confirmados; não são presumidos nem exportados como regra oficial.
 
 ## Referências oficiais consultadas
@@ -122,3 +122,25 @@ Limitação: esta é calibração na própria amostra, não validação independ
 Para repetir a exploração de regiões e blocos JPEG: `.venv\Scripts\python tools\investigate_quality.py --tile-size 128 --min-contrast 10` (rode na raiz; banco aberto somente para leitura, resultados na pasta ignorada `data/`). Experimentos com 256 e 512 também foram executados. Esses parâmetros do script são exploratórios; os usados pelo app ficam na Configuração.
 
 Para repetir o aceite com a configuração atual: `.venv\Scripts\python tools\investigate_quality.py --validate`. A interface foi verificada por testes Streamlit AppTest com arquivos e estado isolados: aprovada exporta diretamente, alerta exige confirmação e bloqueio de tamanho não permite exportar. Nenhuma imagem de produção foi reexportada ou teve seu estado alterado nessa validação.
+
+
+### Imagens parecidas (tarefa 5)
+
+A aba **Criação** compara candidatas/correções ativas entre si e com o histórico de todas as coleções. A aba **Exportação** compara as finais do pacote entre si e com os envios anteriores, incluindo pendentes, aprovados e rejeitados. A própria imagem e a linhagem original/ampliação do mesmo envio não são tratadas como um novo par duplicado. Não há upload nem login em portais.
+
+Dois sinais independentes geram avisos:
+
+- **Hash perceptual:** 63 bits de frequências DCT de luminância, excluindo DC. Distância máxima padrão 10. Serve para variações visuais próximas, inclusive mudanças de resolução e compressão; não reconhece significado.
+- **Paleta semelhante:** coeficiente de sobreposição entre histogramas RGB conjuntos, normalizados por raiz quadrada. Miniatura padrão 64×64, oito faixas por canal, limiar 0,80. Reconhece proximidade de cores, sem considerar a posição de objetos. Pode avisar sobre imagens de assuntos distintos ou fundos iguais; sempre exige revisão de assunto e composição. Pode ser desativado separadamente.
+
+Todos os limiares e parâmetros ajustáveis ficam em **Configuração → Imagens parecidas** e em `similarity_rules`. A análise roda em CPU com Pillow/NumPy e cache em memória invalidado por tamanho/data de alteração do arquivo e parâmetros. Nenhum modelo CLIP é instalado ou carregado; a checagem preserva a VRAM e a serialização existente de LM Studio/ComfyUI.
+
+A regra **uma imagem por conceito** vem ativada. Outra final do mesmo conceito já presente no pacote/histórico bloqueia a preparação, mesmo após confirmar alertas; desative explicitamente essa regra na Configuração para permitir outra variante. O fluxo continua escolhendo a ampliação mais recente de cada conceito. As alternativas candidatas podem ser comparadas antes dessa escolha, sem bloquear sua geração.
+
+A exportação individual e o preparo em lote mostram alertas técnicos e de similaridade **antes** de gravar JPEGs e exigem confirmação. O backend reavalia as imagens ao preparar; pares, limiares, cobertura e confirmação ficam em `export.similarity` no registro do pacote. Alterar a configuração ou o resultado da prévia invalida a confirmação exibida. O preparo em lote também foi corrigido: a confirmação, antes indefinida nesse caminho, agora é explícita e os bloqueios técnicos continuam obrigatórios.
+
+O histórico só pode comparar arquivos disponíveis. Envios externos ou arquivos removidos/ilegíveis aparecem como **comparação incompleta**, sem serem classificados como diferentes. Em **Exportação → Similaridade do pacote e do histórico**, anexe a imagem enviada ao registro que estiver sem referência. O arquivo é validado e copiado para `data/similarity/references/`; o vínculo fica na tabela SQLite `similarity_references`. Anexar novamente o mesmo arquivo é idempotente. Nenhum original ou histórico é removido.
+
+Aceite local de 24/10/2026: **The Filament Dandelion** e **The Transistor Mycelium** recebem alerta de paleta semelhante a **The Capacitor Vine Canopy**, aprovada do Jardim Eletrônico (91,4% e 83,6%, respectivamente). O hash sozinho não encontrou esses pares; o limiar não foi ampliado para forçar esse resultado. São sinais para revisão humana, não uma previsão de rejeição pela Adobe. Há três registros externos sem imagem local nesta amostra, informados como cobertura incompleta.
+
+Para repetir o aceite: `.venv\Scripts\python tools\validate_similarity.py`. O script trabalha sobre uma cópia temporária do SQLite, lê as imagens sem alterá-las e salva o relatório apenas em `data/similarity-validation.json` (ignorado pelo Git). Nomes e resultados de moderação são usados pelo script para conferir o aceite; o detector avalia somente pixels e a identidade do conceito para a regra de limite.
