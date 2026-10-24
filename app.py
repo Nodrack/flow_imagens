@@ -2612,8 +2612,7 @@ def render_performance(orchestrator: Orchestrator, collection_id: str | None) ->
         st.caption("Coleções com mais de uma moeda repetem as mesmas horas em cada linha: não some a coluna \"horas trabalhadas\" entre linhas da mesma coleção.")
         st.caption("Horas = lançamentos/cronômetro + tempo manual dos relatórios. Receita/hora = receita da moeda / horas da coleção (ou de todas, no total); sem horas aparece \"-\".")
         st.caption("Receitas em moedas diferentes aparecem em linhas separadas; custos e resultados não são convertidos nem extrapolados.")
-    render_moderation(orchestrator, collection_id)
-    render_adobe_learning(orchestrator)
+    st.caption("O registro da moderação Adobe fica na aba Registro.")
 
 
 def _cell(value: Any) -> str:
@@ -2844,7 +2843,8 @@ def main() -> None:
 
     collection_id = st.session_state.get("active_collection")
     tabs = st.tabs([
-        "Painel", "Criação", "Ampliação", "Metadados", "Exportação", "Resultados", "Histórico", "Configuração", "Agentes",
+        "Painel", "Criação", "Ampliação", "Metadados", "Exportação", "Registro", "Resultados", "Histórico",
+        "Configuração", "Agentes",
     ])
     with tabs[0]:
         st.title("Produção de imagens para Adobe Stock")
@@ -2901,12 +2901,16 @@ def main() -> None:
         st.title("Exportação e envio humano")
         render_export(orchestrator, collection_id)
     with tabs[5]:
+        st.title("Registro da moderação")
+        render_moderation(orchestrator, collection_id)
+        render_adobe_learning(orchestrator)
+    with tabs[6]:
         st.title("Resultados e esforço")
         render_performance(orchestrator, collection_id)
-    with tabs[6]:
+    with tabs[7]:
         st.title("Histórico")
         render_history(orchestrator, collection_id)
-    with tabs[7]:
+    with tabs[8]:
         st.title("Configuração")
         updated = render_settings(config)
         if updated != config:
@@ -2925,7 +2929,7 @@ def main() -> None:
             if rules.technical_rules_verified and rules.source
             else "Limites técnicos Adobe editáveis acima; ainda não verificados na fonte oficial."
         )
-    with tabs[8]:
+    with tabs[9]:
         st.title("Status dos agentes")
         if collection_id:
             render_agent_status(collection_id)
