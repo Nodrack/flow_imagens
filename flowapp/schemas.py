@@ -251,6 +251,20 @@ class PerformanceEntry(BaseModel):
 LOCAL_TZ = ZoneInfo("Europe/Madrid")
 
 
+class CollectionCostEntry(BaseModel):
+    cost_date: date
+    amount: float = Field(gt=0, le=1_000_000_000, allow_inf_nan=False)
+    currency: str = Field(default="USD", pattern="^[A-Z]{3}$")
+    notes: str = Field(default="", max_length=1000)
+
+    @field_validator("cost_date")
+    @classmethod
+    def cost_not_in_future(cls, value: date) -> date:
+        if value > datetime.now(LOCAL_TZ).date():
+            raise ValueError("A data do custo não pode estar no futuro.")
+        return value
+
+
 class MonthlySalesEntry(BaseModel):
     """Downloads e receita de um mês, conferidos manualmente no painel da Adobe."""
 

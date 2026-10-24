@@ -211,5 +211,7 @@
     ]
   },
   "visual_reference_limit": 12,
-  "visual_reference_prompt_chars": 600
+  "visual_reference_prompt_chars": 600,
+  "comfy_generation_url": "",
+  "comfy_upscale_url": ""
 }
