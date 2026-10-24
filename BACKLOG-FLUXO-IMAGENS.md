@@ -61,8 +61,8 @@ Validação local em 24/10/2026: os dois pares do aceite recebem alerta de palet
 - [x] O planejador recebe as datas próximas ao sugerir conceitos.
 
 ### 7. Briefings com foco comercial
-- [ ] Modelos de briefing prontos para temas que compradores procuram: ingredientes e comida, fundos com espaço para texto, conceitos de negócio e tecnologia com uso claro, ambientes.
-- [ ] O planejador passa a pedir espaço para texto e variação real de composição, cor e cenário entre conceitos.
+- [x] Modelos de briefing prontos para temas que compradores procuram: ingredientes e comida, fundos com espaço para texto, conceitos de negócio e tecnologia com uso claro, ambientes.
+- [x] O planejador passa a pedir espaço para texto e variação real de composição, cor e cenário entre conceitos.
 
 ### 8. GPU na nuvem para as finalistas
 - [ ] Permitir uma URL de ComfyUI diferente por etapa (geração, ampliação), para usar uma GPU alugada só nas imagens finais.

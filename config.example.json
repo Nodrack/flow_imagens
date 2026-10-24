@@ -140,5 +140,76 @@
         "notes": "Marco comercial configurável, não previsão do solstício."
       }
     ]
-  }
+  },
+  "commercial_briefings": {
+    "templates": [
+      {
+        "label": "Ingredientes e comida",
+        "theme": "Ingredientes e comida em composições comerciais",
+        "objective": "Apresentar ingredientes reconhecíveis e combinações apetitosas em cenas distintas, com área limpa para inserir uma mensagem depois.",
+        "audience": "Marcas de alimentos, restaurantes e criadores de conteúdo culinário",
+        "commercial_application": "Banners de cardápio, embalagens e campanhas de alimentos",
+        "orientation": "mixed",
+        "composition_constraints": [
+          "Espaço limpo para texto, com posição definida em cada conceito",
+          "Variar arranjo, ponto de vista, paleta e superfície entre as cenas",
+          "Alimentos e utensílios sem letras ou marcas visíveis"
+        ]
+      },
+      {
+        "label": "Fundos com espaço para texto",
+        "theme": "Fundos para peças de comunicação visual",
+        "objective": "Criar fundos que permitam inserir títulos e chamadas legíveis, com composições e materiais distintos adequados ao uso proposto.",
+        "audience": "Designers, agências e equipes de comunicação",
+        "commercial_application": "Banners, capas de apresentações e anúncios digitais",
+        "orientation": "mixed",
+        "composition_constraints": [
+          "Definir uma área contínua de baixo contraste para texto",
+          "Concentrar elementos de interesse fora da área destinada ao texto",
+          "Não gerar letras, números ou logotipos"
+        ]
+      },
+      {
+        "label": "Negócios com uso claro",
+        "theme": "Situações concretas de negócios e trabalho",
+        "objective": "Representar decisões, colaboração ou organização em situações compreensíveis, ligando cada conceito a uma peça de comunicação específica.",
+        "audience": "Empresas, consultorias e equipes de comunicação corporativa",
+        "commercial_application": "Capas de relatórios, apresentações comerciais e campanhas institucionais",
+        "orientation": "mixed",
+        "composition_constraints": [
+          "Indicar área limpa para título e chamada",
+          "Variar ação, enquadramento, paleta e local entre conceitos",
+          "Usar objetos e ambientes genéricos sem marcas ou texto legível"
+        ]
+      },
+      {
+        "label": "Tecnologia com uso claro",
+        "theme": "Aplicações compreensíveis de tecnologia",
+        "objective": "Mostrar um uso concreto de tecnologia, como proteção de dados, automação ou conectividade, evitando misturas abstratas de símbolos sem uma mensagem clara.",
+        "audience": "Empresas de tecnologia, educadores e equipes de marketing",
+        "commercial_application": "Banners de produtos, materiais educativos e apresentações de soluções",
+        "orientation": "mixed",
+        "composition_constraints": [
+          "Relacionar cada cena a um uso específico e reservar espaço para sua mensagem",
+          "Variar estrutura visual, cores e ambiente entre conceitos",
+          "Interfaces e dispositivos genéricos sem marcas ou texto legível"
+        ]
+      },
+      {
+        "label": "Ambientes",
+        "theme": "Ambientes funcionais para comunicação comercial",
+        "objective": "Apresentar espaços com uma função clara e materiais plausíveis, variando ponto de vista, disposição e cenário para usos distintos de comunicação.",
+        "audience": "Marcas de decoração, arquitetura, imóveis e espaços de trabalho",
+        "commercial_application": "Anúncios de imóveis, campanhas de decoração e capas de catálogos",
+        "orientation": "mixed",
+        "composition_constraints": [
+          "Reservar uma parede ou área de baixo contraste para texto",
+          "Variar disposição, ponto de vista, materiais e paleta sem repetir a mesma cena",
+          "Geometria plausível e objetos sem marcas"
+        ]
+      }
+    ]
+  },
+  "visual_reference_limit": 12,
+  "visual_reference_prompt_chars": 600
 }

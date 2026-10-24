@@ -42,9 +42,9 @@ class FakeLMStudio:
         self.recommendations = list(recommendations or [])
         self.counter = 0
 
-    def plan_collection(self, model, brief, attempts, progress, *, count, avoid, style_guide, hint, lessons="", seasonal=""):
+    def plan_collection(self, model, brief, attempts, progress, *, count, avoid, style_guide, hint, lessons="", seasonal="", visual_references=None):
         self.plan_calls.append({
-            "count": count, "avoid": list(avoid), "style": style_guide, "hint": hint, "lessons": lessons, "seasonal": seasonal,
+            "count": count, "avoid": list(avoid), "style": style_guide, "hint": hint, "lessons": lessons, "seasonal": seasonal, "visual_references": list(visual_references or []),
         })
         progress("planejando")
         concepts = []
@@ -473,3 +473,52 @@ def test_pipeline_supplies_seasonal_context_to_every_planner_batch(pipeline_env,
             assert 'Campanha futura' in call['seasonal'] and '2026-11-11' in call['seasonal']
         else:
             assert call['seasonal'] == ''
+
+
+def test_visual_references_cross_batches_and_new_images_with_configured_limits(pipeline_env):
+    from flowapp.agents import PLANNER_INSTRUCTION_VERSION
+    tmp_path, orchestrator, pipeline, fake_lm, _, profile = pipeline_env
+    orchestrator.config.visual_reference_limit = 2
+    orchestrator.config.visual_reference_prompt_chars = 50
+    save_default_profile(tmp_path / 'data', profile)
+    collection = _collection(orchestrator, count=6)
+    run_id = pipeline.create(collection, 'full', 'text-model', '')
+    pipeline.execute(run_id)
+    assert pipeline.status(run_id)['status'] == 'completed'
+    assert not fake_lm.plan_calls[0]['visual_references']
+    references = [json.loads(value) for value in fake_lm.plan_calls[1]['visual_references']]
+    assert [value['concept'] for value in references] == ['Conceito número 4', 'Conceito número 5']
+    assert all(value['composition_and_copy_space'] == 'Assunto à direita, espaço livre à esquerda' for value in references)
+    assert all(len(value['prompt_en']) <= 50 for value in references)
+    assert len(fake_lm.plan_calls[1]['avoid']) == 5
+    new_run = pipeline.create(collection, 'new_image', 'text-model', '')
+    pipeline.execute(new_run)
+    assert pipeline.status(new_run)['status'] == 'completed'
+    assert json.loads(fake_lm.plan_calls[-1]['visual_references'][-1])['concept'] == 'Conceito número 6'
+    with orchestrator.database.connect() as connection:
+        versions = connection.execute("SELECT DISTINCT instruction_version FROM agent_runs WHERE agent_name = 'planner'").fetchall()
+    assert [row['instruction_version'] for row in versions] == [PLANNER_INSTRUCTION_VERSION]
+
+
+def test_planner_receives_commercial_rules_and_visual_context_in_request():
+    captured = []
+
+    def respond(request):
+        if request.url.path == '/api/v1/models':
+            return httpx.Response(200, json={'models': [{'key': 'm', 'loaded_instances': [{'id': 'm'}]}]})
+        captured.append(json.loads(request.content)['messages'])
+        output = PlannerOutput(concepts=[_plan(1)], collection_summary='Resumo', style_guide='Soft light')
+        return httpx.Response(200, json={'choices': [{'message': {'content': output.model_dump_json()}}]})
+
+    client = _mock_lmstudio(respond)
+    try:
+        client.plan_collection('m', CollectionBrief(theme='Tema', objective='Objetivo'),
+                               visual_references=['{"composition":"Diagonal, blue palette, outdoor garden"}'])
+    finally:
+        client.close()
+    system, user = captured[0][0]['content'], captured[0][1]['content']
+    assert 'área limpa e de baixo contraste' in system
+    assert 'composição (arranjo' in system and 'cor (paleta' in system and 'cenário (ambiente' in system
+    assert 'Respeite as restrições explícitas do briefing' in system
+    assert 'Diagonal, blue palette, outdoor garden' in user
+    assert 'aplicação concreta' in system and 'sem dados fornecidos' in system

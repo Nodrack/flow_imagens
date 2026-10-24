@@ -33,6 +33,9 @@ _discard_stale_flowapp()
 
 from flowapp.adobe import ADOBE_CATEGORIES, CSV_TITLE_LIMIT, adobe_csv, category_number
 from flowapp.agents import AgentError, INSTRUCTION_VERSION, adobe_lessons
+from flowapp.briefings import (
+    CommercialBriefings, ORIENTATIONS, template_widget_values, templates_from_rows, templates_rows,
+)
 from flowapp.comfy import ComfyError
 from flowapp.config import AppConfig, load_config, save_config
 from flowapp.database import (
@@ -219,6 +222,31 @@ def render_seasonal_settings(calendar: SeasonalCalendar):
     return enabled, int(horizon), rows.to_dict("records") if hasattr(rows, "to_dict") else rows
 
 
+def render_briefings_settings(settings: CommercialBriefings):
+    import pandas as pd
+    with st.expander("Modelos de briefing comercial"):
+        st.caption("Edite os pontos de partida para novas coleções. Os campos podem ser adaptados antes de produzir; são exemplos de uso, sem promessa de procura ou vendas.")
+        data = pd.DataFrame(templates_rows(settings), columns=["Modelo", "Tema", "Objetivo", "Público",
+                            "Aplicação comercial", "Orientação", "Restrições (separe por ;)"])
+        edited = st.data_editor(data, num_rows="dynamic", hide_index=True, key="commercial_templates_editor",
+            column_config={
+                "Modelo": st.column_config.TextColumn(required=True),
+                "Tema": st.column_config.TextColumn(required=True),
+                "Objetivo": st.column_config.TextColumn(required=True),
+                "Orientação": st.column_config.SelectboxColumn(options=list(ORIENTATIONS.values()), default="Mista"),
+            })
+    return edited.to_dict("records")
+
+
+def render_brief_template_picker(config: AppConfig, prefix: str, *, include_orientation=True) -> None:
+    templates = {template.label: template for template in config.commercial_briefings.templates}
+    selected = st.selectbox("Modelo de briefing", [None, *templates], key=f"{prefix}_template",
+                           format_func=lambda label: label or "Preencher livremente")
+    if st.button("Aplicar modelo ao briefing", key=f"{prefix}_apply", disabled=selected is None):
+        st.session_state.update(template_widget_values(templates[selected], prefix, include_orientation=include_orientation))
+    st.caption("Aplicar preenche tema, objetivo, público, aplicação e restrições para você revisar antes da criação.")
+
+
 def render_seasonal_calendar(calendar: SeasonalCalendar, reference_date: date | None = None) -> None:
     st.subheader("Próximos prazos sazonais")
     if not calendar.enabled:
@@ -249,6 +277,8 @@ def render_seasonal_calendar(calendar: SeasonalCalendar, reference_date: date | 
 
 def render_settings(config: AppConfig) -> AppConfig:
     st.subheader("Conexões e limites")
+    if st.session_state.pop("settings_saved", False):
+        st.success("Configuração salva em config.json (sem credenciais).")
     st.caption("Os endereços são locais por padrão. O token opcional do LM Studio vem da variável LM_STUDIO_API_KEY.")
     models = model_list(config.lmstudio_base_url)
     planner_options = model_options(models)
@@ -371,12 +401,23 @@ def render_settings(config: AppConfig) -> AppConfig:
         }
         st.caption("Paleta semelhante é um alerta amplo: confirme assunto e composição. Nenhum modelo usa VRAM nesta análise.")
         calendar_enabled, calendar_horizon, calendar_edits = render_seasonal_settings(config.seasonal_calendar)
+        briefing_edits = render_briefings_settings(config.commercial_briefings)
+        reference_limit = st.number_input("Conceitos anteriores descritos ao planejador", min_value=1,
+            max_value=100, value=config.visual_reference_limit,
+            help="Limita os resumos de composição e prompt. Os títulos de todos os conceitos continuam sendo enviados para evitar repetição.")
+        reference_chars = st.number_input("Caracteres do prompt por referência visual", min_value=50,
+            max_value=4000, value=config.visual_reference_prompt_chars, step=50)
         saved = st.form_submit_button("Salvar configuração", type="primary")
     if saved:
         try:
             seasonal_calendar = calendar_from_rows(calendar_edits, enabled=calendar_enabled, horizon_days=calendar_horizon)
         except (ValueError, TypeError, KeyError) as error:
             st.error(f"Calendário inválido; a configuração não foi salva: {error}")
+            return config
+        try:
+            commercial_briefings = templates_from_rows(briefing_edits)
+        except (ValueError, TypeError, KeyError) as error:
+            st.error(f"Modelos de briefing inválidos; a configuração não foi salva: {error}")
             return config
         new_config = AppConfig(
             comfy_base_url=comfy_url,
@@ -397,6 +438,9 @@ def render_settings(config: AppConfig) -> AppConfig:
             quality_rules=quality_values,
             similarity_rules=similarity_values,
             seasonal_calendar=seasonal_calendar,
+            commercial_briefings=commercial_briefings,
+            visual_reference_limit=int(reference_limit),
+            visual_reference_prompt_chars=int(reference_chars),
             export_rules={
                 "min_megapixels": min_mp or None,
                 "max_megapixels": max_mp or None,
@@ -410,19 +454,20 @@ def render_settings(config: AppConfig) -> AppConfig:
         save_config(CONFIG_PATH, new_config)
         get_orchestrator.clear()
         get_agent_pipeline.clear()
-        st.success("Configuração salva em config.json (sem credenciais).")
-        return new_config
+        st.session_state["settings_saved"] = True
+        st.rerun()
     return config
 
 
 def render_manual_collection_creation(database: Database, orchestrator: Orchestrator) -> None:
+    render_brief_template_picker(orchestrator.config, "manual_brief", include_orientation=False)
     with st.form("new_manual_collection"):
         name = st.text_input("Nome da coleção", placeholder="Jardins urbanos")
-        theme = st.text_input("Tema", placeholder="Cultivo de alimentos em apartamentos")
-        objective = st.text_area("Objetivo", placeholder="Criar imagens versáteis para campanhas de sustentabilidade")
-        audience = st.text_input("Público", placeholder="Marcas de jardinagem e moradia")
-        application = st.text_input("Aplicação comercial", placeholder="Campanha digital, banner e editorial")
-        constraints = st.text_input("Restrições de composição", placeholder="espaço para texto à esquerda; sem texto visível")
+        theme = st.text_input("Tema", placeholder="Cultivo de alimentos em apartamentos", key="manual_brief_theme")
+        objective = st.text_area("Objetivo", placeholder="Criar imagens versáteis para campanhas de sustentabilidade", key="manual_brief_objective")
+        audience = st.text_input("Público", placeholder="Marcas de jardinagem e moradia", key="manual_brief_audience")
+        application = st.text_input("Aplicação comercial", placeholder="Campanha digital, banner e editorial", key="manual_brief_commercial_application")
+        constraints = st.text_input("Restrições de composição", placeholder="espaço para texto à esquerda; sem texto visível", key="manual_brief_constraints")
         catalog = st.text_area("Catálogo existente para evitar repetição", height=80)
         sales = st.text_area("Dados observados de vendas (opcional)", height=80)
         st.markdown("#### Conceito inicial")
@@ -772,21 +817,24 @@ def render_collection_creation(database: Database, orchestrator: Orchestrator, c
     models = model_list(config.lmstudio_base_url)
     text_options = model_options(models)
     vision_options = model_options(models, vision=True)
+    render_brief_template_picker(config, "new_brief")
     with st.form("new_collection"):
         name = st.text_input("Nome da coleção", placeholder="Jardins urbanos")
-        theme = st.text_input("Tema", placeholder="Cultivo de alimentos em apartamentos")
-        objective = st.text_area("Objetivo", placeholder="Criar imagens versáteis para campanhas de sustentabilidade")
-        audience = st.text_input("Público", placeholder="Marcas de jardinagem e moradia")
+        theme = st.text_input("Tema", placeholder="Cultivo de alimentos em apartamentos", key="new_brief_theme")
+        objective = st.text_area("Objetivo", placeholder="Criar imagens versáteis para campanhas de sustentabilidade", key="new_brief_objective")
+        audience = st.text_input("Público", placeholder="Marcas de jardinagem e moradia", key="new_brief_audience")
         orientation_column, count_column = st.columns(2)
         orientation = orientation_column.selectbox(
             "Orientação", list(ORIENTATION_LABELS), format_func=ORIENTATION_LABELS.get,
+            key="new_brief_orientation",
         )
         count = count_column.number_input("Quantidade de imagens", min_value=1, max_value=20, value=4)
-        application = st.text_input("Aplicação comercial", placeholder="Campanha digital, banner e editorial")
+        application = st.text_input("Aplicação comercial", placeholder="Campanha digital, banner e editorial", key="new_brief_commercial_application")
         with st.expander("Opções avançadas (opcional)"):
             constraints = st.text_input(
                 "Restrições de composição (separe por ;)",
                 placeholder="espaço para texto à esquerda; sem texto visível",
+                key="new_brief_constraints",
             )
             catalog = st.text_area("Catálogo existente para evitar repetição", height=80)
             sales = st.text_area("Dados observados de vendas", height=80)
