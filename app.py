@@ -289,6 +289,10 @@ def render_settings(config: AppConfig) -> AppConfig:
             "min_sharpness": "Nitidez mínima (Laplaciano)", "max_noise": "Ruído máximo estimado",
             "max_black_percent": "Percentual máximo de pretos", "max_white_percent": "Percentual máximo de estourados",
             "black_level": "Nível preto (0 a 127)", "white_level": "Nível branco (128 a 255)",
+            "region_size": "Lado da região em pixels (16 a 1024)",
+            "region_min_contrast": "Contraste mínimo da região (desvio padrão)",
+            "min_local_sharpness_p25": "Nitidez regional mínima (percentil 25)",
+            "max_local_detail_ratio": "Razão regional máxima entre Laplaciano e gradiente",
         }.items():
             quality_values[field] = st.number_input(label, value=getattr(config.quality_rules, field))
         saved = st.form_submit_button("Salvar configuração", type="primary")

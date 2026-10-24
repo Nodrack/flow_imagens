@@ -41,6 +41,10 @@
     "max_black_percent": 20,
     "max_white_percent": 55,
     "black_level": 5,
-    "white_level": 250
+    "white_level": 250,
+    "region_size": 128,
+    "region_min_contrast": 10,
+    "min_local_sharpness_p25": 12,
+    "max_local_detail_ratio": 1
   }
 }

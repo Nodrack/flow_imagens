@@ -106,6 +106,19 @@ Para trazer os ganhos reais, use **Importar ganhos da Adobe** na aba Resultados:
 
 A aba Exportação analisa o JPEG final em CPU: variância do Laplaciano, estimativa de ruído por filtro passa-altas, percentual de luminância preta/branca, resolução, megapixels e tamanho real com metadados. Limites de MP e bytes bloqueiam a preparação; heurísticas geram alertas e exigem confirmação. O relatório fica no registro do pacote. Nenhuma chamada a LM Studio, ComfyUI ou Adobe é feita pela análise.
 
-Os seis limiares ficam na Configuração. O expansor “Calibração com imagens moderadas” compara arquivos locais com os resultados da Adobe sem alterar o histórico. Ruído também responde a textura e exposição usa luminância, não clipping isolado de canais.
+Os limiares globais e regionais ficam na Configuração. O expansor “Calibração com imagens moderadas” compara arquivos locais com os resultados da Adobe sem alterar o histórico. Ruído também responde a textura e exposição usa luminância, não clipping isolado de canais.
 
-Calibração de 24/10/2026: as 11 aprovadas com arquivo local têm nitidez entre 107,46 e 750,72, ruído entre 0,38 e 1,88 e até 50,77% de branco. Defaults: nitidez mínima 100, ruído máximo 12, pretos até 20%, brancos até 55%, níveis 5/250. A Flor de Silício tem nitidez 74,39 e gera alerta. Deserto de Circuitos (444,96; ruído 1,14) e The CPU Sunflower (232,34; ruído 0,92) se sobrepõem às aprovadas. **O aceite de detectar as três rejeitadas sem alertar aprovadas permanece pendente**: esses indicadores globais não separam as referências. Não foram criadas exceções por nome ou histórico. Referências externas sem arquivo local não podem ser calibradas.
+Calibração de 24/10/2026: as 11 aprovadas com arquivo local têm nitidez global entre 107,46 e 750,72, ruído entre 0,38 e 1,88 e até 50,77% de branco. Os indicadores globais detectam apenas A Flor de Silício; a análise por regiões acrescenta dois alertas configuráveis:
+
+- Nitidez regional: percentil 25 da variância do Laplaciano nas regiões com contraste, mínimo 12.
+- Alta frequência regional: mediana da razão entre variância do Laplaciano e energia do gradiente, máximo 1. Pode indicar textura ou artefatos; não identifica a causa da rejeição.
+
+Padrões: regiões completas de 128×128 pixels nativos, contraste mínimo de 10 (desvio padrão da luminância). Regiões planas são ignoradas para preservar espaço para texto; imagens sem regiões elegíveis continuam com as métricas globais. Bordas incompletas não entram na análise regional, mas entram na exposição global. Tudo roda em CPU, sem alterar a serialização de GPU.
+
+Validação local: **11/11 aprovadas passam e 3/3 rejeitadas por qualidade recebem pelo menos um alerta**. A Flor de Silício tem nitidez regional 10,16; The CPU Sunflower, 11,24; o mínimo das aprovadas é 13,70. Deserto de Circuitos tem razão regional 1,09, contra máximo de 0,85 nas aprovadas. O relatório completo fica localmente em `data/quality-calibration-validation.json`.
+
+Limitação: esta é calibração na própria amostra, não validação independente. The CPU Sunflower não se separa das aprovadas em regiões de 256 ou 512 pixels. Não há garantia para novas imagens nem diagnóstico do motivo exato da Adobe. Os limiares não usam nomes, identificadores ou rótulos de moderação na avaliação. Referências externas sem arquivo local não foram analisadas.
+
+Para repetir a exploração de regiões e blocos JPEG: `.venv\Scripts\python tools\investigate_quality.py --tile-size 128 --min-contrast 10` (rode na raiz; banco aberto somente para leitura, resultados na pasta ignorada `data/`). Experimentos com 256 e 512 também foram executados. Esses parâmetros do script são exploratórios; os usados pelo app ficam na Configuração.
+
+Para repetir o aceite com a configuração atual: `.venv\Scripts\python tools\investigate_quality.py --validate`. A interface foi verificada por testes Streamlit AppTest com arquivos e estado isolados: aprovada exporta diretamente, alerta exige confirmação e bloqueio de tamanho não permite exportar. Nenhuma imagem de produção foi reexportada ou teve seu estado alterado nessa validação.

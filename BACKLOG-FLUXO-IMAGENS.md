@@ -37,11 +37,13 @@ O app conta 4 aprovadas e 5 rejeitadas, mas o portfólio já tem 11 imagens dos 
 ## P0. Qualidade antes do envio
 
 ### 4. Checagem técnica automática
-- [ ] Nitidez (por exemplo, variância do Laplaciano), estimativa de ruído e exposição (porcentagem de pixels estourados ou pretos) em cada imagem final.
-- [ ] Conferir resolução, megapixels e tamanho de arquivo contra os limites já salvos na Configuração.
-- [ ] Resultado por imagem: aprovada, alerta ou bloqueada, com o motivo. A exportação avisa antes de incluir uma imagem com alerta.
-- [ ] Limiares configuráveis. Calibrar usando as imagens já aprovadas e as rejeitadas por qualidade como referência.
+- [x] Nitidez (por exemplo, variância do Laplaciano), estimativa de ruído e exposição (porcentagem de pixels estourados ou pretos) em cada imagem final.
+- [x] Conferir resolução, megapixels e tamanho de arquivo contra os limites já salvos na Configuração.
+- [x] Resultado por imagem: aprovada, alerta ou bloqueada, com o motivo. A exportação avisa antes de incluir uma imagem com alerta.
+- [x] Limiares configuráveis. Calibrar usando as imagens já aprovadas e as rejeitadas por qualidade como referência.
 - Aceite: as 3 imagens rejeitadas por qualidade recebem pelo menos um alerta, e as aprovadas passam.
+
+Validação local em 24/10/2026: 3/3 rejeitadas por qualidade com alerta e 11/11 aprovadas locais sem alerta. Calibração na própria amostra; limitações e reprodução no README.
 
 ### 5. Detecção de imagens parecidas
 - [ ] Comparar candidatas entre si e com tudo o que já foi enviado (hash perceptual e, se couber na VRAM, embeddings como CLIP).
