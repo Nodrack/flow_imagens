@@ -34,9 +34,11 @@ from flowapp.agents import AgentError, INSTRUCTION_VERSION, adobe_lessons
 from flowapp.comfy import ComfyError
 from flowapp.config import AppConfig, load_config, save_config
 from flowapp.database import (
-    APPROVAL_PREFIX, Database, DuplicateJobError, InvalidTransition, REJECTION_PREFIX,
+    APPROVAL_PREFIX, Database, DuplicateJobError, InvalidTransition, MAX_WORK_MINUTES,
+    REJECTION_PREFIX, TimerTooLong,
 )
 from flowapp.images import ImageStore, ImageValidationError
+from flowapp.metrics import format_hours, format_per_hour, revenue_per_hour
 from flowapp.moderation import MODERATION_BY_LABEL, MODERATION_LABELS, moderation_changes
 from flowapp.orchestrator import Orchestrator
 from flowapp.pipeline import (
@@ -267,6 +269,11 @@ def render_settings(config: AppConfig) -> AppConfig:
         )
         source = st.text_input("Fonte e data de conferência dos limites", config.export_rules.source)
         quality = st.slider("Qualidade JPEG", 85, 100, config.export_rules.jpeg_quality)
+        timer_max_hours = st.number_input(
+            "Limite do cronômetro de horas (h)", min_value=1.0, max_value=24.0,
+            value=float(config.timer_max_hours), step=1.0,
+            help="Acima disso o cronômetro é tratado como esquecido: ao parar, você informa os minutos reais.",
+        )
         saved = st.form_submit_button("Salvar configuração", type="primary")
     if saved:
         new_config = AppConfig(
@@ -284,6 +291,7 @@ def render_settings(config: AppConfig) -> AppConfig:
             free_vram_between_phases=free_vram,
             generation_sizes=sizes,
             upscale_factor=float(upscale_factor),
+            timer_max_hours=float(timer_max_hours),
             export_rules={
                 "min_megapixels": min_mp or None,
                 "max_megapixels": max_mp or None,
@@ -431,6 +439,8 @@ def render_collection_overview(
                 job for job in database.list_recoverable_jobs(collection_id)
                 if job["status"] in {"queued", "running"}
             ]
+            open_timer = database.open_timer()
+            timer_blocks = bool(open_timer and open_timer["collection_id"] == collection_id)
             with st.expander("Remover coleção", expanded=False):
                 st.warning(
                     "Esta ação permanente apaga a coleção, seus conceitos, imagens, workflows, "
@@ -441,6 +451,11 @@ def render_collection_overview(
                         f"Remoção bloqueada: há {len(active_jobs)} trabalho(s) ComfyUI ativos. "
                         "Aguarde a conclusão ou cancele-os antes."
                     )
+                if timer_blocks:
+                    st.error(
+                        "Remoção bloqueada: há um cronômetro de horas aberto nesta coleção. "
+                        "Pare ou descarte-o na aba Resultados ou na barra lateral."
+                    )
                 confirmation = st.text_input(
                     f"Digite {collection['name']} para confirmar",
                     key=f"delete_collection_confirm_{collection_id}",
@@ -448,7 +463,7 @@ def render_collection_overview(
                 delete_clicked = st.button(
                     "Remover permanentemente",
                     type="secondary",
-                    disabled=bool(active_jobs) or confirmation != collection["name"],
+                    disabled=bool(active_jobs) or timer_blocks or confirmation != collection["name"],
                     key=f"delete_collection_{collection_id}",
                 )
                 if delete_clicked:
@@ -1880,6 +1895,178 @@ def render_history(orchestrator: Orchestrator, collection_id: str | None) -> Non
             st.dataframe(jobs, width="stretch", hide_index=True)
 
 
+def elapsed_seconds(started_at: str) -> float:
+    return max((datetime.now(UTC) - datetime.fromisoformat(started_at)).total_seconds(), 0)
+
+
+def elapsed_label(started_at: str) -> str:
+    """Há quanto tempo um cronômetro está aberto (HH:MM)."""
+    minutes = int(elapsed_seconds(started_at) // 60)
+    return f"{minutes // 60}h{minutes % 60:02d}"
+
+
+def render_timer_stop(orchestrator: Orchestrator, running: dict[str, Any], key: str) -> str | None:
+    """Botão Parar com proteção contra cronômetro esquecido. Devolve a mensagem do resultado, se parou."""
+    database = orchestrator.database
+    max_minutes = orchestrator.config.timer_max_hours * 60
+    overrun_key = f"timer_overrun_{running['id']}"
+    if overrun_key in st.session_state:
+        measured = st.session_state[overrun_key]
+        st.warning(
+            f"O cronômetro mediu {measured / 60:.1f} h, acima do limite de "
+            f"{orchestrator.config.timer_max_hours:.0f} h. Informe os minutos realmente trabalhados."
+        )
+        minutes = st.number_input(
+            "Minutos reais", min_value=1.0, max_value=float(MAX_WORK_MINUTES),
+            value=float(min(max(measured, 1.0), MAX_WORK_MINUTES)) if measured <= MAX_WORK_MINUTES
+            else float(max_minutes),
+            step=5.0, key=f"{key}_override_minutes",
+        )
+        if st.button("Confirmar minutos e parar", key=f"{key}_override_confirm", type="primary"):
+            try:
+                database.stop_timer(running["id"], minutes_override=minutes, max_minutes=max_minutes)
+                st.session_state.pop(overrun_key, None)
+                return f"Cronômetro parado: {minutes:.1f} min registrados."
+            except ValueError as error:
+                show_error(error)
+        return None
+    if st.button("Parar cronômetro", key=f"{key}_stop", type="primary", width="stretch"):
+        try:
+            minutes = database.stop_timer(running["id"], max_minutes=max_minutes)
+        except TimerTooLong as error:
+            st.session_state[overrun_key] = error.minutes
+            st.rerun()
+        except ValueError as error:
+            show_error(error)
+        else:
+            if minutes is None:
+                return "Menos de 1 minuto: cronômetro descartado, nada foi registrado."
+            return f"Cronômetro parado: {minutes:.1f} min registrados em {running['collection_name']}."
+    return None
+
+
+@st.fragment(run_every=30)
+def _sidebar_timer_fragment(orchestrator: Orchestrator) -> None:
+    running = orchestrator.database.open_timer()
+    if not running:
+        return
+    limit = orchestrator.config.timer_max_hours
+    elapsed_hours = elapsed_seconds(running["started_at"]) / 3600
+    with st.container(border=True):
+        st.markdown(f"**Cronômetro aberto** em {running['collection_name']}")
+        text = f"Rodando há {elapsed_label(running['started_at'])}"
+        if elapsed_hours > limit:
+            st.warning(f"{text}, acima do limite de {limit:.0f} h. Esqueceu de parar?")
+        else:
+            st.caption(text)
+        message = render_timer_stop(orchestrator, running, "sidebar_timer")
+    if message:
+        st.toast(message)
+        st.rerun()
+
+
+def render_sidebar_timer(orchestrator: Orchestrator) -> None:
+    """Cronômetro aberto, compacto, para não ser esquecido (atualiza a cada 30 s)."""
+    if orchestrator.database.open_timer():
+        _sidebar_timer_fragment(orchestrator)
+
+
+def render_work_hours(orchestrator: Orchestrator, collection_id: str) -> None:
+    database = orchestrator.database
+    st.markdown("#### Horas trabalhadas")
+    st.caption(
+        "A receita por hora soma duas fontes de tempo: estes lançamentos/cronômetro e o "
+        "\"Tempo manual (minutos)\" informado junto com os relatórios acima. "
+        "O tempo de um lançamento ou cronômetro que atravessa a meia-noite vai inteiro para a data de início."
+    )
+    message = st.session_state.pop("work_hours_message", None)
+    if message:
+        st.success(message)
+    running = database.open_timer()
+    if running is None:
+        if st.button("Iniciar cronômetro", key="timer_start"):
+            try:
+                database.start_timer(collection_id)
+                st.rerun()
+            except (ValueError, KeyError) as error:
+                show_error(error)
+    else:
+        same = running["collection_id"] == collection_id
+        if same:
+            st.info(f"Cronômetro rodando há {elapsed_label(running['started_at'])}.")
+        else:
+            st.warning(
+                f"Há um cronômetro aberto na coleção \"{running['collection_name']}\" "
+                f"(há {elapsed_label(running['started_at'])}). Pare-o para iniciar outro aqui."
+            )
+        columns = st.columns(2)
+        with columns[0]:
+            stop_message = render_timer_stop(orchestrator, running, "timer")
+        if stop_message:
+            st.session_state["work_hours_message"] = stop_message
+            st.rerun()
+        if columns[1].button("Descartar cronômetro", key="timer_discard"):
+            try:
+                database.discard_timer(running["id"])
+                st.session_state.pop(f"timer_overrun_{running['id']}", None)
+                st.rerun()
+            except ValueError as error:
+                show_error(error)
+    with st.form("work_session_entry", clear_on_submit=True):
+        st.markdown("**Lançamento manual**")
+        form_columns = st.columns(3)
+        work_date = form_columns[0].date_input("Data do trabalho", value=date.today())
+        hours = form_columns[1].number_input("Horas", min_value=0.0, max_value=24.0, step=0.25, help="Aceita decimais (1,5 = 1h30).")
+        extra_minutes = form_columns[2].number_input("Minutos adicionais", min_value=0, max_value=59, step=5)
+        work_notes = st.text_input("Nota (opcional)", max_chars=1000)
+        add = st.form_submit_button("Lançar horas")
+    if add:
+        try:
+            database.add_work_session(
+                collection_id, work_date.isoformat(), hours * 60 + extra_minutes, work_notes,
+            )
+            st.session_state["work_hours_message"] = "Lançamento salvo."
+            st.rerun()
+        except (ValueError, KeyError) as error:
+            show_error(error)
+    sessions = database.list_work_sessions(collection_id)
+    if sessions:
+        labels = {"manual": "manual", "timer": "cronômetro"}
+        st.dataframe(
+            [
+                {
+                    "data": item["work_date"],
+                    "origem": labels[item["source"]] + (" (em andamento)" if item["minutes"] is None else ""),
+                    "minutos": item["minutes"],
+                    "nota": item["notes"],
+                }
+                for item in sessions
+            ],
+            width="stretch", hide_index=True,
+        )
+        closed = [item for item in sessions if item["minutes"] is not None]
+        if closed:
+            with st.expander("Excluir lançamento"):
+                choice = st.selectbox(
+                    "Lançamento", [item["id"] for item in closed], key="work_delete_choice",
+                    format_func=lambda value: next(
+                        f"{item['work_date']} - {item['minutes']:.1f} min ({labels[item['source']]})"
+                        + (f" - {item['notes']}" if item["notes"] else "")
+                        for item in closed if item["id"] == value
+                    ),
+                )
+                confirmed = st.checkbox(
+                    "Confirmo a exclusão deste lançamento", key=f"work_delete_confirm_{choice}",
+                )
+                if st.button("Excluir lançamento", disabled=not confirmed, key="work_delete"):
+                    try:
+                        database.delete_work_session(choice)
+                        st.session_state["work_hours_message"] = "Lançamento excluído."
+                        st.rerun()
+                    except KeyError as error:
+                        show_error(error)
+
+
 def render_performance(orchestrator: Orchestrator, collection_id: str | None) -> None:
     st.subheader("Resultados e custos informados")
     st.caption("Registre dados conferidos manualmente ou provenientes de relatórios oficiais disponíveis. Não há projeção de ganhos.")
@@ -1934,8 +2121,10 @@ def render_performance(orchestrator: Orchestrator, collection_id: str | None) ->
         if records:
             st.markdown("#### Registros desta coleção")
             st.dataframe(records, width="stretch", hide_index=True)
+        render_work_hours(orchestrator, collection_id)
 
     comparisons = orchestrator.database.performance_comparison()
+    hours_metrics = revenue_per_hour(comparisons, orchestrator.database.work_minutes_by_collection())
     today = date.today()
     for row in comparisons:
         created = datetime.fromisoformat(row["created_at"]).date()
@@ -1959,12 +2148,37 @@ def render_performance(orchestrator: Orchestrator, collection_id: str | None) ->
                     "geração (s)": item["generation_seconds"] or 0,
                     "upscale (s)": item["upscale_seconds"] or 0,
                     "tempo manual (min)": item["manual_minutes"] or 0,
+                    "horas trabalhadas": format_hours(hours_metrics["collections"][item["collection_id"]]["hours"]),
+                    "receita/hora": format_per_hour(
+                        hours_metrics["collections"][item["collection_id"]]["by_currency"]
+                        .get(item["revenue_currency"], {}).get("per_hour"),
+                        item["revenue_currency"] or "",
+                    ),
                 }
                 for item in comparisons
             ],
             width="stretch",
             hide_index=True,
         )
+        total = hours_metrics["total"]
+        st.markdown("#### Total geral por moeda")
+        if total["by_currency"]:
+            st.dataframe(
+                [
+                    {
+                        "moeda": currency,
+                        "receita": values["revenue"],
+                        "base de horas (todas as coleções)": format_hours(total["hours"]),
+                        "receita/hora": format_per_hour(values["per_hour"], currency),
+                    }
+                    for currency, values in total["by_currency"].items()
+                ],
+                width="stretch", hide_index=True,
+            )
+        else:
+            st.caption(f"Sem receita registrada. Horas totais: {format_hours(total['hours'])}.")
+        st.caption("Coleções com mais de uma moeda repetem as mesmas horas em cada linha: não some a coluna \"horas trabalhadas\" entre linhas da mesma coleção.")
+        st.caption("Horas = lançamentos/cronômetro + tempo manual dos relatórios. Receita/hora = receita da moeda / horas da coleção (ou de todas, no total); sem horas aparece \"-\".")
         st.caption("Receitas em moedas diferentes aparecem em linhas separadas; custos e resultados não são convertidos nem extrapolados.")
     render_moderation(orchestrator, collection_id)
     render_adobe_learning(orchestrator)
@@ -2182,6 +2396,7 @@ def main() -> None:
             st.session_state["active_collection"] = selected
         else:
             st.session_state.pop("active_collection", None)
+        render_sidebar_timer(orchestrator)
         if st.session_state.get("active_collection"):
             with st.container(border=True):
                 render_agent_status(st.session_state["active_collection"], compact=True)
