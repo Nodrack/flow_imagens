@@ -222,4 +222,13 @@ A seleção desses perfis não pressupõe conta, contrato ou aprovação em nenh
 
 ### Nome da ferramenta (tarefa 10)
 
-O nome escolhido é **PhotoYield**, aplicado ao título da aba do navegador, à barra lateral, ao cabeçalho do Painel e ao inicializador. O projeto era apresentado como Fluxo Imagens. A pasta/repositório `flow_imagens`, o pacote `flowapp`, os identificadores de execuções e os dados existentes continuam compatíveis; não é necessário mover arquivos ou migrar o histórico por causa do nome.
+O nome escolhido é **PhotoYield**, aplicado ao título da aba do navegador, à barra lateral, ao cabeçalho do Painel e ao inicializador. O projeto era apresentado como Fluxo Imagens. A pasta e o repositório passaram a se chamar `photoyield`. O pacote Python continua `flowapp`; os identificadores das execuções e os dados existentes foram preservados.
+
+
+### Renomeação da pasta e do repositório
+
+O projeto fica em `D:\Python Apps\photoyield` e o repositório é [Nodrack/photoyield](https://github.com/Nodrack/photoyield). O identificador no painel agentkit passa a ser `photoyield`; os registros antigos são migrados sem mudar seus IDs. O cliente ComfyUI usa `photoyield-local`, mantendo o reconhecimento dos trabalhos por `prompt_id`.
+
+O script `tools/relocate_project.py` permite conferir e migrar os caminhos absolutos depois de renomear uma instalação anterior. Por padrão só mostra o plano; `--apply` exige execução a partir da pasta nova e com a antiga já renomeada ou vazia. Faça isso com o app e os agentes parados. O script mantém backup consistente do SQLite, cópia das linhas do projeto no banco central (se `--hub-db` for informado), arquivos de ativação e lançadores do ambiente virtual em `data/relocation-backup-<data>/`, ignorada pelo Git. Imagens não são regravadas e referências a pastas diferentes não são alteradas.
+
+Exemplo de conferência, antes da renomeação: `.venv\Scripts\python tools\relocate_project.py --old-root "D:\Python Apps\flow_imagens" --new-root "D:\Python Apps\photoyield"`. Após renomear, execute da pasta nova com `--apply`; informe também `--hub-db` com o caminho do `hub.sqlite3` do agentkit para migrar as execuções antigas do projeto. Os lançadores do ambiente virtual são regenerados para apontar à pasta nova. As cópias de segurança não são atualizadas para o caminho novo, preservando o estado anterior para recuperação.
