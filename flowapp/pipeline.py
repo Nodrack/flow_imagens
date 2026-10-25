@@ -1,4 +1,4 @@
-"""Agentes do flow_imagens: planejar, gerar, revisar e recriar imagens de uma coleção.
+"""Agentes do PhotoYield: planejar, gerar, revisar e recriar imagens de uma coleção.
 
 A mecânica de execução (fila em segundo plano, status por agente, log, cancelamento,
 retomada e trava de GPU entre processos) vem do `agentkit`; as execuções aparecem no

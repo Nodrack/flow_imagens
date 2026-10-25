@@ -1,4 +1,4 @@
-# Fluxo Imagens
+# PhotoYield
 
 Aplicativo local em Python para planejar colecoes, preparar prompts, gerar candidatos por workflows API importados no ComfyUI, selecionar e revisar imagens, ampliar selecionados, sugerir metadados e preparar pacotes para envio manual ao Adobe Stock.
 
@@ -218,3 +218,8 @@ Perfis iniciais e fontes oficiais consultadas em **25/10/2026**:
 - **Getty/iStock:** desativado conforme a [página oficial para colaboradores](https://www.gettyimages.co.uk/workwithus), que não aceita arquivos gerados ou modificados com modelos generativos.
 
 A seleção desses perfis não pressupõe conta, contrato ou aprovação em nenhuma agência. Os perfis são configurações locais, não conectores de upload. Os testes usam arquivos e banco isolados e verificam políticas, persistência, preservação do fluxo Adobe, JPEG/PNG, transparência, redução/limites, metadados e confirmação na interface. Não houve submissão a agências nem alteração de imagens de produção nessa validação.
+
+
+### Nome da ferramenta (tarefa 10)
+
+O nome escolhido é **PhotoYield**, aplicado ao título da aba do navegador, à barra lateral, ao cabeçalho do Painel e ao inicializador. O projeto era apresentado como Fluxo Imagens. A pasta/repositório `flow_imagens`, o pacote `flowapp`, os identificadores de execuções e os dados existentes continuam compatíveis; não é necessário mover arquivos ou migrar o histórico por causa do nome.

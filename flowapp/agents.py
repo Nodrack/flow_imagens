@@ -77,7 +77,7 @@ def adobe_lessons(feedback: dict | None, *, examples: bool = False) -> str:
 
 
 class LMStudioClient(_BaseLMStudioClient):
-    """Cliente do agentkit com os agentes de domínio do flow_imagens."""
+    """Cliente do agentkit com os agentes de domínio do PhotoYield."""
 
     def _reasoning(self, model_id: str, agent: str) -> str | None:
         """Modo de raciocínio do agente, ou None quando o modelo não oferece essa opção."""

@@ -1,4 +1,4 @@
-# Fluxo Imagens: backlog de melhorias
+# PhotoYield: backlog de melhorias
 
 Origem: avaliação de 24/10/2026 do app local (todas as abas, somente leitura) e do portfólio na Adobe Stock.
 Documento completo: Google Drive, pasta Fluxo Imagens, "Fluxo Imagens - Avaliação e plano".
@@ -79,4 +79,4 @@ Custos entram no resultado após custos por hora, com a receita/hora preservada 
 Fontes e políticas registradas em 25/10/2026. Dreamstime disponível com condições; Freepik/Magnific em rascunho técnico; Shutterstock e Getty/iStock desativados conforme suas políticas. Pacotes separados do fluxo Adobe, com metadados de referência manual.
 
 ### 10. Nome da ferramenta
-- [ ] Aguardando decisão (opções: Safra, Viveiro, Prensa, Lote, Ateliê). Depois de decidido, trocar o título do app e as referências na interface.
+- [x] Nome escolhido: **PhotoYield**. Título do app, barra lateral, cabeçalho do Painel, inicializador e documentação atualizados.
