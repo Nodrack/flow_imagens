@@ -85,7 +85,7 @@ ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config.json"
 DATA_ROOT = ROOT / "data"
 
-st.set_page_config(page_title="Fluxo Imagens", page_icon="🖼", layout="wide")
+st.set_page_config(page_title="PhotoYield", page_icon="🖼", layout="wide")
 
 
 def code_version() -> float:
@@ -3358,7 +3358,7 @@ def main() -> None:
     collections = database.list_collections()
 
     with st.sidebar:
-        st.title("Fluxo Imagens")
+        st.title("PhotoYield")
         st.caption("Pipeline local com aprovações humanas")
         labels = {item["id"]: item["name"] for item in collections}
         selected = st.selectbox(
@@ -3384,7 +3384,7 @@ def main() -> None:
         "Configuração", "Agentes",
     ])
     with tabs[0]:
-        st.title("Produção de imagens para Adobe Stock")
+        st.title("PhotoYield — produção de imagens")
         st.caption("Planejamento → prompts → candidatos → seleção → upscale → revisão final → metadados → preparação manual")
         render_diagnostics(config, orchestrator)
         st.divider()

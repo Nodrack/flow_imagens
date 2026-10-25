@@ -1,7 +1,7 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-title Fluxo Imagens - inicializacao local
+title PhotoYield - inicializacao local
 
 echo [1/4] Verificando Python 3.11 ou superior...
 if not exist ".venv\Scripts\python.exe" (
@@ -50,7 +50,7 @@ if not defined PORT (
     goto :fail
 )
 
-echo Iniciando Streamlit somente em localhost na porta %PORT%...
+echo Iniciando PhotoYield com Streamlit somente em localhost na porta %PORT%...
 echo URL: http://127.0.0.1:%PORT%
 ".venv\Scripts\python.exe" -m streamlit run app.py --server.address 127.0.0.1 --server.port %PORT%
 if errorlevel 1 (

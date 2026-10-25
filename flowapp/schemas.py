@@ -206,7 +206,7 @@ ALLOWED_PROFILE_ROLES = {
 
 
 class ComfyWorkflowProfile(WorkflowProfile):
-    """Workflow do agentkit restrito aos tipos e papéis usados pelo flow_imagens."""
+    """Workflow do agentkit restrito aos tipos e papéis usados pelo PhotoYield."""
 
     kind: str = Field(pattern="^(generation|upscale|inpainting)$")
 
