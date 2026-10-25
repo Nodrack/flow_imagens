@@ -25,7 +25,7 @@ from flowapp.schemas import ComfyWorkflowProfile, ConceptPlan, WorkflowState
 
 
 Progress = Callable[[str], None]
-PROJECT = "flow_imagens"
+PROJECT = "photoyield"
 
 
 class Orchestrator:

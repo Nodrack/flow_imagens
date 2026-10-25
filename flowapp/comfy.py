@@ -12,7 +12,7 @@ class ComfyUIClient(_BaseComfyUIClient):
     """Cliente do agentkit com a regra do flow: geração sempre com seed mapeada."""
 
     def __init__(self, base_url: str, timeout: float = 20.0, **options) -> None:
-        options.setdefault("client_id", "flow-imagens-local")
+        options.setdefault("client_id", "photoyield-local")
         super().__init__(base_url, timeout, **options)
 
     def validate_profile(
